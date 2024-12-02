@@ -1,0 +1,357 @@
+---
+title: "Category regressions with GMV only"
+---
+
+Run alcohol only and alcohol + brainPAD but with the category regression instead of continuous
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(broom)
+library(kableExtra)
+
+```
+
+```{r}
+
+model_version <- "main"
+
+```
+
+Set the filepaths for input and output
+ENSURE THIS IS A LOCATION SUITABLE FOR STORAGE OF UKB DATA
+```{r}
+
+input_path <- # data set storage location
+
+output_path <- # script outputs storage location
+
+```
+
+Put the date IDPs processed
+```{r}
+
+run_date <- "2024-11-13" 
+
+```
+
+
+```{r}
+
+load(paste0(output_path, "IDP_names_table_", run_date, ".RData"))
+
+```
+
+
+Load genetic PCs
+```{r}
+
+load(paste0(output_path, "genetic_PC_", run_date, ".RData"))
+
+```
+
+Load the processed imaging covariates
+From step 2 of the pipeline
+```{r}
+
+load(paste0(output_path, "/processed_imaging_covariates_", "2024-07-29", ".RData"))
+
+```
+
+Load the covariates that have been processed with backfilling imaging data with baseline data and then imputation
+From step 3 of the pipeline
+```{r}
+
+load(paste0(output_path, "/imputed_covariates_", run_date, ".RData"))
+
+```
+
+```{r}
+
+load(paste0(output_path, model_version, "_brainPAD_", run_date, ".RData"))
+
+```
+
+
+Combine the tables to make a regression table
+Create a column for scaled brainPAD
+```{r}
+
+regression_table <- imputation_results %>%
+  select(-c(sex, age, date)) %>%
+  filter(n_eid %in% experimental_brainPAD$n_eid) %>%
+  left_join(genetic_PC, by = "n_eid") %>%
+  left_join(imaging_covariates, by = "n_eid") %>%
+  left_join(select(experimental_brainPAD, -age), by = "n_eid") %>%
+  mutate(scaled_brainPAD = scale(brainPAD, center = TRUE, scale = TRUE))
+  
+rm(imputation_results)
+rm(imaging_covariates)
+rm(genetic_PC)
+gc()
+
+```
+
+Create the alcohol category column
+Use the week drinks variable in the covariates to create bins
+If changing this make sure to also change in demographics or the numbers will not line up!
+```{r}
+
+regression_table <- regression_table %>%
+  mutate(drink_group = case_when(
+    alcohol_status == "Never" ~ 6,
+    alcohol_status == "Former" ~ 6,
+    week_drinks <= 1 ~ 0, # Current alcohol consumption with less than 1 drink per week are the reference group
+    week_drinks <= 7 ~ 1,
+    week_drinks <= 14 ~ 2,
+    week_drinks <= 21 ~ 3,
+    week_drinks <= 28 ~ 4,
+    week_drinks > 28 ~ 5))
+
+
+```
+
+
+Note that the < 1 group includes some participants who indicated they do drink (current) in data field 1558 but who end up with calculated week drinks of 0
+
+Factor drink groups, and specify that 0 (lightest drinking group) is the reference level
+```{r}
+
+regression_table$drink_group <- factor(regression_table$drink_group)
+#regression_table$drink_group <- relevel(regression_table$drink_group, ref = 0)
+
+class(regression_table$drink_group)
+levels(regression_table$drink_group)
+
+```
+
+Check the N in each drinking category
+```{r}
+
+group_n <- regression_table %>%
+  group_by(drink_group) %>%
+  tally()
+
+group_n
+
+```
+
+
+Define a function for regression (will run on all the different sets of IDPs)
+
+```{r}
+
+
+do_IDP_regression <- function(IDP_table, vars_list, regression_table) {
+  # Function to perform regression using covariates in the regression table on all the IDPs in the supplied IDP table
+  # Will return a table with IDP, alcohol estimate and P value
+  
+  # Join the IDPs onto the regression table
+  # Changed this to inner join, R has been sneakily dropping my n the WHOLE time
+  regression_table <- inner_join(IDP_table, regression_table, by = "n_eid", all = FALSE)
+  regression_table <- na.omit(regression_table)
+  # Print the N so user is alerted if this happens
+  print(paste0("IDP N=", nrow(IDP_table), ", regression N=", nrow(regression_table)))
+  
+  IDP_names <- colnames(IDP_table)
+  IDP_names <- IDP_names[IDP_names != "n_eid"]
+  
+  regression <- lapply(IDP_names, function(x) glm(formula(paste("unlist(regression_table[,x]) ~",
+                                             paste(vars_list, collapse = "+"))),
+                                              family = "gaussian", data = regression_table))
+  regression <- lapply(regression, tidy)
+  
+  regression_results <- data.frame("alcohol_beta" = c(), "alcohol_p" = c())
+
+  for (n in 1:length(regression)) {
+    
+    IDP <- IDP_names[n]
+    summary_tibble <- regression[[n]]
+    
+    summary_tibble <- summary_tibble %>%
+      mutate(term = gsub("\\(", "", term)) %>%
+      mutate(term = gsub("\\)", "", term)) %>%
+      mutate(term = tolower(term)) %>%
+      select(term, estimate, std.error, p.value) %>%
+      pivot_longer(cols = c(estimate, std.error, p.value), names_to = "stat", values_to = "value")
+    
+    summary_tibble <- summary_tibble %>%
+      mutate(col_name = case_when(
+      (stat == "estimate") ~ paste0(term, "_beta"),
+      (stat == "std.error") ~ paste0(term, "_se"),
+      (stat == "p.value") ~ paste0(term, "_p"))) %>%
+      select(col_name, value) %>%
+      pivot_wider(names_from = col_name, values_from = value)
+    
+    new_row <- data.frame("IDP" = IDP)
+    
+    new_row <- cbind(new_row, summary_tibble)
+    
+    
+    regression_results <- rbind(regression_results, new_row)
+    
+  }
+  
+
+  return(regression_results)
+}
+
+
+```
+
+
+Scale brainPAD
+```{r}
+
+regression_table <- regression_table %>%
+  mutate(scaled_brainPAD = scale(brainPAD, center = TRUE, scale = TRUE))
+
+```
+
+
+Set up the list of covariates (updated 7/25/24)
+```{r}
+
+covariates <-c("sex", "age", "scaled_pack_years", "income", "education_years",
+               "BMI", "diabetes", "systolic_BP", "diastolic_BP", "health_rating", "longstanding",
+               "head_size", "site", "date", "rfMRI_motion",
+               "PC_1", "PC_2", "PC_3", "PC_4", "PC_5", "PC_6", "PC_7", "PC_8", "PC_9", "PC_10")
+
+```
+
+
+Load IDPs and perform regression
+```{r}
+
+total_volume_IDPs <- c("X26514.2.0", "X26518.2.0", "X26527.2.0", "total_wm")
+
+
+load(paste0(output_path, "ukbio_IDP_", run_date, ".RData"))
+
+ukbio_IDP <- ukbio_IDP %>%
+  select(c(n_eid, all_of(total_volume_IDPs)))
+
+```
+
+
+```{r}
+
+predictors <- c("drink_group")
+
+```
+
+
+```{r}
+
+alcohol_model <- do_IDP_regression(ukbio_IDP, c(predictors, covariates), regression_table)
+
+```
+
+
+=================================================================
+Alcohol and brainPAD model
+
+```{r}
+
+predictors <- c("drink_group", "brainPAD")
+
+```
+
+
+```{r}
+
+alcohol_brainPAD_model <- do_IDP_regression(ukbio_IDP, c(predictors, covariates), regression_table)
+
+```
+
+Make a table with just GMV from Freesurfer ASEG
+X26518.2.0 ~ total grey matter volume
+
+```{r}
+
+GMV_alcohol <- alcohol_model %>%
+  filter(IDP == "X26518.2.0") %>%
+  select(-IDP) %>%
+  pivot_longer(everything(), names_to = "covariate", values_to = "value") %>%
+  dplyr::rename("alcohol" = value)
+
+GMV_alcohol_brainPAD <- alcohol_brainPAD_model %>%
+  filter(IDP == "X26518.2.0") %>%
+  select(-IDP) %>%
+  pivot_longer(everything(), names_to = "covariate", values_to = "value") %>%
+  dplyr::rename("with_brainPAD" = value)
+
+GMV_table <- GMV_alcohol %>%
+  right_join(GMV_alcohol_brainPAD, by = "covariate")
+
+```
+
+Save the regression results - NO IDP info
+```{r}
+
+save(alcohol_model, file = paste0(output_path, model_version, "_alcohol_model_", Sys.Date(), ".RData"))
+
+save(alcohol_brainPAD_model, file = paste0(output_path, model_version, "_alcohol_brainPAD_model_", Sys.Date(), ".RData"))
+
+```
+
+Make the table for GMv before and after controlling for brainPAD
+```{r}
+
+GMV_table <- GMV_table %>%
+  filter(grepl("drink_group", covariate)) %>%
+  mutate(drink_group = gsub("drink_group", "", covariate)) %>%
+  separate(col = drink_group, into = c("drink_group", "measure"), sep = "_") %>%
+  select(-covariate) %>%
+  filter(measure != "se") %>%
+  pivot_longer(cols = -c(drink_group, measure), names_to = "model", values_to = "value") %>%
+  mutate(col_name = paste0(model, "_", measure)) %>%
+  arrange(model) %>%
+  select(-c(measure, model)) %>%
+  pivot_wider(id_cols = drink_group, names_from = col_name, values_from = value) %>%
+  # Add a row to account for the reference group (infrequent, < 1)
+  rbind(data.frame("drink_group" = c("0"), "alcohol_beta" = c(0), "alcohol_p" = c(NA),
+                   "with_brainPAD_beta" = c(0), "with_brainPAD_p" = c(NA))) %>%
+  mutate(drink_group = factor(drink_group, levels = c(6, 0, 1, 2, 3, 4, 5))) %>%
+  arrange(drink_group) %>%
+  # Add readable group names
+  mutate(week_drinks = case_when(
+    drink_group == 6 ~ "0 (never)",
+    drink_group == 0 ~ "<=1*",
+    drink_group == 1 ~ ">1-7",
+    drink_group == 2 ~ ">7-14",
+    drink_group == 3 ~ ">14-21",
+    drink_group == 4 ~ ">21-28",
+    drink_group == 5 ~ ">28")) %>%
+  select(-drink_group) %>%
+  relocate(week_drinks, .before = alcohol_beta) %>%
+  mutate_at(vars(alcohol_beta, with_brainPAD_beta), ~formatC(.x, digits = 2, format = "f")) %>%
+  mutate_at(vars(alcohol_p, with_brainPAD_p), ~ifelse(.x > 0.009, formatC(.x, digits = 2, format = "f"),
+                                                           formatC(.x, digits = 2, format = "e")))
+
+GMV_table
+
+```
+
+Save this as a nice .csv for the paper
+```{r}
+
+write.csv(GMV_table, file = paste0("GMV_category_table_", Sys.Date(), ".csv"))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+

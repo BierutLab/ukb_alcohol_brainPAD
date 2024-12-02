@@ -1,0 +1,223 @@
+---
+title: "Supplement excel results"
+---
+
+
+Output the regression results as .xlsx files with multiple tabs and a general info front page
+
+
+```{r}
+library(dplyr) # Run install.packages("tidyverse") to get this
+library(tidyr) # Run install.packages("tidyr") to get this
+library(ggplot2)
+library("reshape") # Run install.packages("reshape") to get this
+library("broom")
+library(kableExtra) # Run install.packages("kableExtra")
+library(openxlsx)
+
+```
+
+Set the date prior steps of the pipeline were run
+```{r}
+
+run_date <- "2024-11-13"
+
+```
+
+
+Set the filepaths for input and output
+ENSURE THIS IS A LOCATION SUITABLE FOR STORAGE OF UKB DATA
+```{r}
+
+input_path <- # data set storage location
+
+output_path <- # script outputs storage location
+
+```
+
+==============================================================================
+Generate excel file with main analysis results
+
+
+Load the n-tracker, list of IDPs with info, all model coefficients
+```{r}
+
+load(paste0(output_path, "main_n_tracker_", run_date, ".RData"))
+
+# Assumption that these outputs live in the same folder as this script
+load(paste0("main_all_CI_", "2024-11-14", ".RData"))
+
+load(paste0(output_path, "IDP_names_table_", run_date, ".RData"))
+
+```
+
+Load week drinks regressions with and without brainPAD
+```{r}
+
+load(paste0(output_path, "main_alcohol_model_", run_date, ".RData"))
+load(paste0(output_path, "main_alcohol_brainPAD_model_", run_date, ".RData"))
+
+```
+
+Re-arrange a little for side by side comparison
+```{r}
+
+GMV_alcohol <- alcohol_model %>%
+  filter(IDP == "X26518.2.0") %>%
+  select(-IDP) %>%
+  pivot_longer(everything(), names_to = "covariate", values_to = "value") %>%
+  dplyr::rename("alcohol" = value)
+
+GMV_alcohol_brainPAD <- alcohol_brainPAD_model %>%
+  filter(IDP == "X26518.2.0") %>%
+  select(-IDP) %>%
+  pivot_longer(everything(), names_to = "covariate", values_to = "value") %>%
+  dplyr::rename("with_brainPAD" = value)
+
+GMV_table <- GMV_alcohol_brainPAD %>%
+  left_join(GMV_alcohol, by = "covariate") %>%
+  relocate(with_brainPAD, .after = alcohol)
+
+```
+
+
+```{r}
+
+GMV_table <- GMV_table %>%
+  mutate(measure = case_when(
+    grepl("_beta", covariate) ~ "beta",
+    grepl("_se", covariate) ~ "se",
+    grepl("_p", covariate) ~ "p")) %>%
+  mutate(covariate = gsub("_beta", "", covariate)) %>%
+  mutate(covariate = gsub("_se", "", covariate)) %>%
+  mutate(covariate = gsub("_p", "", covariate)) %>%
+  pivot_longer(cols = -c(covariate, measure), names_to = "model", values_to = "value") %>%
+  mutate(col_name = paste0(model, "_", measure)) %>%
+  arrange(model) %>%
+  select(-c(measure, model)) %>%
+  pivot_wider(id_cols = covariate, names_from = col_name, values_from = value)
+
+GMV_table
+
+```
+
+Laura likes to get a table of the regression results as a .csv to look though, export them in this format
+Use the openxlsx package to do this
+Make a table with info about what is in the sheet
+UPDATE THIS IF ADDING CONTROLS
+
+```{r}
+
+general_info <- data.frame((rbind(
+  c("Column info", "Explanation of column / covariate names", " "),
+  c("n_tracker", "Table with n participants by analysis step", " "),
+  c("feature IDPs", "List of model feature IDPs with coefficients and 95% confidence intervals", " "),
+  c("GMV", "GMV ~ drinking_category +/- brainPAD + covariates", " "),
+  c("Paper title: ", "Alcohol consumption is associated with premature brain aging", " "),
+  c("Contact: ", "Vera Thornton, vthornton@wustl.edu", " "),
+  c("Date", paste0(Sys.Date()), " "))))
+
+colnames(general_info) <- c("Tab", "Description", "Equation")
+
+general_info %>%
+  kable() %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+
+```
+
+
+Make a table with an explanation of what the columns / covariates are:
+```{r}
+
+column_info <- data.frame((rbind(
+  # IDP
+ c("IDP", "UK Biobank data field for IDP", " "),
+ c("IDP_name", "Descriptive name of IDP", " "),
+ c("MRI", "MRI sequence (T1, T2, dMRI, rfMRI)", " "),
+ c("source", "Processing pipeline or parcellation for group of IDPs", " "),
+ c("dMRI", "dMRI measure for applicable IDPs (FA, MD, ICVF, ISOVF, MO, OD)", " "),
+ 
+ c("intercept", "Regression intercept", " "),
+ 
+ # Week drinks and pack years
+ c("drink_group", "Level of alcohol consumption from drinks per week", "weekly = 1568 + 1578 + 1588 + 1598 + 1608 + 5364,
+   monthly = (4407 + 4418 + 4429 + 4440 + 4451 + 4462) / 4.3"),
+ c("scaled_pack_years", "Pack years smoking (normalized)", "20161"),
+ 
+ # Person
+ c("sex", "Sex (genetic)", "22001"),
+ c("age", "Age at imaging appointment (years)", "21003"),
+ 
+ # Attainment
+ c("income", "Income (pounds)", "738"),
+ c("education_years", "Years of education derived from Qualifications", "6138"),
+ 
+ # Health
+ c("bmi", "Body mass index", "21001"),
+ c("diabetes", "Diabetes diagnosed by a doctor", "2443"),
+ c("systolic_bp", "Systolic blood pressure (mmHg)", "4080 (automatic), 93 (manual)"),
+ c("diastolic_bp", "Diastolic blood pressure (mmHg)", "4079 (automatic), 94 (manual)"),
+ c("health_rating", "Rate health on scale of 1 to 5", "2178"),
+ c("longstanding", "Diastolic blood pressure (mmHg)", "2188"),
+ 
+ # Imaging
+ c("head_size", "Volumetric scaling from T1 to standard space", "25000"),
+ c("site", "Imaging site", "54"),
+ c("date", "Imaging date (days since January 1 1970)", "53"),
+ c("rfmri_motion", "Mean rfMRI motion", "25741"),
+ 
+ # Genetic
+ c("pc_n", "nth genetic principal component", "22009"))))
+
+colnames(column_info) <- c("Column name", "Description", "Derived from data fields")
+
+column_info %>%
+  kable() %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+```
+
+Select the IDPs which were given to the model as features
+```{r}
+
+all_feature_CI <- all_feature_CI %>%
+  mutate(map = case_when(
+    IDP == "X26514.2.0" ~ "total brain volume",
+    IDP == "X26518.2.0" ~ "total grey matter volume",
+    IDP == "total_wm" ~ "total white matter volume",
+    IDP == "X26527.2.0" ~ "total CSF volume",
+    TRUE ~ map)) %>%
+  mutate(map = factor(map, levels = c("total brain volume", "total grey matter volume",
+                                       "total white matter volume", "total CSF volume",
+                                       "freesurfer_DKT", "freesurfer_ASEG", "weighted_mean", "P25"))) %>%
+  arrange(map) %>%
+  mutate(MRI = factor(MRI, levels = c("T1", "T2", "dMRI", "rfMRI"))) %>%
+  arrange(MRI) %>%
+  select(IDP, IDP_name, MRI, map, dMRI, coef, l.ci, u.ci) %>%
+  dplyr::rename("source" = map, "95_lower" = l.ci, "95_upper" = u.ci)
+
+```
+
+
+
+
+Save the xlsx sheet with multiple tabs, including general info to tell people what this is
+
+```{r}
+
+results <- list("general_info" = general_info,
+                        "column_info" = column_info,
+                        "n_tracker" = n_tracker,
+                "feature IDPs" = all_feature_CI,
+                "GMV" = GMV_table)
+
+write.xlsx(results, file = paste0("brain_age_full_results_", Sys.Date(), ".xlsx"))
+
+```
+
+
+Some cleanup after generating:
+- Go check that column widths make sense
+- I like to add a comment about what is meant by "in common" in the last column of the correlation results
+

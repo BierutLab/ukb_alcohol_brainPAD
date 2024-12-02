@@ -1,0 +1,292 @@
+---
+title: "Pipeline step 7 exclusions"
+---
+
+8/20/24 Exclude participants for neurological disease and former alcohol use
+
+
+```{r}
+library(dplyr) # Run install.packages("tidyverse") to get this
+library(tidyr) # Run install.packages("tidyr") to get this
+library(ggplot2)
+library("reshape") # Run install.packages("reshape") to get this
+library(kableExtra) # Run install.packages("kableExtra")
+library(viridis)
+library(forcats)
+
+```
+
+Set the filepaths for input and output
+ENSURE THIS IS A LOCATION SUITABLE FOR STORAGE OF UKB DATA
+```{r}
+
+input_path <- # data set storage location
+
+output_path <- # script outputs storage location
+
+```
+
+Put the date IDPs processed
+```{r}
+
+run_date <- "2024-11-13"
+
+```
+
+Load eid, N tracker, and covariates from the pipeline
+```{r}
+
+load(paste0(output_path, "n_tracker_p2_", run_date, ".RData"))
+load(paste0(output_path, "all_eid_p2_", run_date, ".RData"))
+load(paste0(output_path, "un_scaled_covariates_", run_date, ".RData"))
+
+
+```
+
+================Remove participants with neurological disease===========================================
+
+4/29/22 Had been using strategy of removing all participants with any IDP an outlier by >4 SD
+Checked this against known neuro disease, it only catches 30% of participants with known disease
+While also removing 30% of the sample
+Decided to simply use the diagnosis codes from data field 20002 to filter out participants and leave the outliers alone
+
+
+6/15/23 Include the disease list from both baseline and imaging appointments, they are different
+Participants filtered out if the disease is reported at any appointment
+
+```{r}
+
+disease_baseline <- read.csv(paste0(input_path, "disease_baseline_6_13_23.csv"))
+disease_imaging <- read.csv(paste0(input_path, "disease_imaging_6_13_23.csv"))
+
+```
+
+These data fields include all disease codes, although we are using them to filter for neurological disease only
+
+Combine baseline and imaging, filter for only the people in our imaging cohort
+```{r}
+
+all_disease <- disease_baseline %>%
+  left_join(disease_imaging, by = "n_eid") %>%
+  filter(n_eid %in% all_eid)
+
+```
+
+
+Make a list of codes for neurological diseases that might impact brain structure
+I referenced the Palmer paper (Gray 2020) as a starting point
+
+Dementia = 1263
+Parkinsons = 1262
+Chronic degenerative neurological = 1258
+Guillan-Barre syndrome = 1256
+Multiple sclerosis = 1261
+Other demyelinating disease = 1397
+Stroke or ischaemic stroke = 1081
+Brain cancer = 1032
+Brain hemorrhage = 1491
+Brain / intracranial abcess = 1245
+Cerebral aneurysm = 1425
+Cerebral palsy = 1433
+Encephalitis = 1246
+Epilepsy = 1264
+Head injury = 1266
+Nervous system infection = 1244
+Ischaemic stroke = 1583
+Meningeal cancer = 1031
+Meningioma = 1659
+Meningitis = 1247
+Motor neuron disease = 1259
+Neurological disease / trauma = 1240
+Spina bifida = 1524
+Subdural hematoma = 1083
+Subarachnoid hemorrhage = 1086
+Transient ischemic attack = 1082
+
+
+```{r}
+
+neuro_codes <- data.frame((rbind(
+  c("Dementia / Alzheimers", 1263),
+  c("Parkinsons", 1262),
+  c("Chronic degenerative neurological", 1258),
+  c("Guillan-Barre syndrome", 1256),
+  c("Multiple sclerosis", 1261),
+  c("Other demyelinating disease", 1397),
+  c("Stroke or ischaemic stroke", 1081),
+  c("Brain cancer", 1032),
+  c("Brain hemorrhage", 1491),
+  c("Brain / intracranial abscess", 1245),
+  c("Cerebral aneurysm", 1425),
+  c("Cerebral palsy", 1433),
+  c("Encephalitis", 1246),
+  c("Epilepsy", 1264),
+  c("Head injury", 1266),
+  c("Nervous system infection", 1244),
+  c("Ischaemic stroke", 1583),
+  c("Meningeal cancer", 1031),
+  c("Meningioma", 1659),
+  c("Meningitis", 1247),
+  c("Motor neuron disease", 1259),
+  c("Neurological disease / trauma", 1240),
+  c("Spina bifida", 1524),
+  c("Subdural hematoma", 1083),
+  c("Subarachnoid hemorrhage", 1086),
+  c("Transient ischemic attack", 1082))))
+
+neuro_codes <- neuro_codes %>%
+  dplyr::rename("condition" = X1, "code" = X2) %>%
+  mutate(code = formatC(code, format = "d"))
+
+```
+
+Use the table of neuro codes to construct a table for neuro disease
+```{r}
+
+neuro_disease <- all_disease %>%
+  pivot_longer(cols = -n_eid, names_to = "field", values_to = "code") %>%
+  select(-field) %>%
+  filter(! is.na(code)) %>%
+  # Remove any duplicates due to data from both the baseline and imaging visits
+  distinct(.keep_all = TRUE) %>%
+  mutate(code = formatC(code, format = "d")) %>%
+  filter(code %in% neuro_codes$code) %>%
+  left_join(neuro_codes, by = "code")
+
+```
+
+Capture how many in our cohort have an unclassifiable illness
+```{r}
+
+unclassifiable <- all_disease %>%
+  pivot_longer(cols = -n_eid, names_to = "field", values_to = "code") %>%
+  select(-field) %>%
+  filter(! is.na(code)) %>%
+  # Remove any duplicates due to data from both the baseline and imaging visits
+  distinct(.keep_all = TRUE) %>%
+  mutate(code = formatC(code, format = "d")) %>%
+  filter(code %in% "99999")
+
+n_unclassifiable <- nrow(unclassifiable)
+  
+unclassifiable <- data.frame(
+  "condition" = c("Unclassified illness (neuro and all other)"),
+  "code" = c("99999"),
+  "n" = c(n_unclassifiable),
+  "percent" = c(formatC(n_unclassifiable / length(all_eid) * 100, digits = 2, format = "f")))
+
+unclassifiable
+
+```
+
+About 10% have an unclassified illness (could be anything, cardiac, liver, etc). Not adding this to the neuro disease table because this number includes ALL diseases, not just ones that are neuroligical in nature and thus relevant to us. Consider the number of neuro conditions listed relative to all possible conditions given in data coding 6.
+
+
+Use the table to tally up how many total individuals are affected, and which diseases
+
+```{r}
+
+neuro_disease_table <- neuro_disease %>%
+  group_by(condition) %>%
+  tally() %>%
+  left_join(neuro_codes, by = "condition") %>%
+  relocate(code, .before = n) %>%
+  mutate(percent = n / length(all_eid) * 100) %>%
+  mutate(percent = formatC(percent, digits = 2, format = "f")) %>%
+  arrange(desc(n))
+
+neuro_disease_table %>%
+  kable(caption = paste0("Prevalence of neurological conditions in model comparison cohort\nN=",
+                         length(all_eid), ", N affected=", length(unique(neuro_disease$n_eid)))) %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+```
+Save the neuro disease table, it will go in the supplemental info
+```{r}
+
+save(neuro_disease_table, file = paste0(output_path, "neuro_exclusions_", Sys.Date(), ".RData"))
+
+```
+
+
+Use the eids in the neuro_disease table to filter out participants with a diagnosis of neurological disease
+
+```{r}
+
+all_eid <- all_eid[! all_eid %in% neuro_disease$n_eid]
+
+```
+
+Update the N tracker
+
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "Neuro diagnosis removed", "N" = length(all_eid)))
+
+```
+
+Drop former alcohol use
+```{r}
+
+un_scaled <- un_scaled %>%
+  filter(n_eid %in% all_eid)
+
+```
+
+How many are former?
+```{r}
+
+un_scaled %>%
+  group_by(alcohol_status) %>%
+  tally()
+
+```
+
+
+```{r}
+
+un_scaled <- un_scaled %>%
+  filter(alcohol_status != "Former")
+
+un_scaled %>%
+  group_by(alcohol_status) %>%
+  tally()
+
+```
+
+Update all_eid
+```{r}
+
+all_eid <- un_scaled$n_eid
+
+```
+
+
+Update N tracker
+
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "Former alcohol consumption removed", "N" = length(all_eid)))
+
+```
+
+Save the n tracker and post-exclusions list of eid
+```{r}
+
+save(all_eid, file = paste0(output_path, "all_eid_p7_", Sys.Date(), ".RData"))
+save(n_tracker, file = paste0(output_path, "n_tracker_p7_", Sys.Date(), ".RData"))
+
+```
+
+```{r}
+
+n_tracker
+
+```
+
+
+
+
+
+
+

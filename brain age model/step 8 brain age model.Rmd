@@ -1,0 +1,1392 @@
+---
+title: "Brain age model"
+---
+
+
+10/14/24 drink cutoff to 7
+
+Train, test, and run the brain age model to predict brain age and calculate brain predicted age difference (brainPAD)
+
+This modelling method is based on the model presented in Cole 2020
+
+```{r}
+
+model_version <- "main"
+
+```
+
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(boot)
+library(cowplot)
+library(glmnet)
+library(kableExtra)
+library(broom)
+
+```
+
+Set the filepaths for input and output
+ENSURE THIS IS A LOCATION SUITABLE FOR STORAGE OF UKB DATA
+```{r}
+
+input_path <- # data set storage location
+
+output_path <- # script outputs storage location
+
+```
+
+Put the date IDPs processed
+```{r}
+
+run_date <- "2024-11-13" 
+
+```
+
+Set the cutoff to define light / moderate alcohol consumption, and the size of the train / test set
+```{r}
+
+sample_N <- 5000
+drink_cutoff <- 7
+
+```
+
+Set the dpi for output figures
+```{r}
+
+set_dpi <- 1200
+
+```
+
+Set theme to apply to all plots
+```{r}
+
+theme_replace(
+  # Set the axis text size
+  axis.text.x = element_text(size = 13), axis.text.y = element_text(size = 13),
+  # Background white with no grid lines
+  panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "white", color = "dark grey"))
+
+```
+
+Load IDPs and N tracker
+```{r}
+
+load(paste0(output_path, "IDP_names_table_", run_date, ".RData"))
+load(paste0(output_path, "ukbio_IDP_", run_date, ".RData"))
+load(paste0(output_path, "n_tracker_p7_", run_date, ".RData"))
+load(paste0(output_path, "all_eid_p7_", run_date, ".RData"))
+
+```
+
+Rename ukbio_IDPs for use in this script
+```{r}
+
+feature_IDPs <- ukbio_IDP
+
+rm(ukbio_IDP)
+
+```
+
+Filter feature IDPs in case participants removed for other reasons along the pipeline
+```{r}
+
+feature_IDPs <- feature_IDPs %>%
+  filter(n_eid %in% all_eid)
+
+```
+
+Get covariates for the brain age model
+```{r}
+
+load(paste0(output_path, "un_scaled_covariates_", run_date, ".RData"))
+
+```
+
+
+Join age (unscaled) to feature IDPs
+```{r}
+
+feature_IDPs <- feature_IDPs %>%
+  left_join(select(un_scaled, c(n_eid, age)), by = "n_eid") %>%
+  # Extra na.omit because missing values break the model
+  na.omit()
+
+```
+
+Make a list of the imaging variables to use in test / train data
+Exclude 25000, scaling from T1. This is a processing parameter and is controlled for in the regression model
+```{r}
+
+IDP_list <- colnames(select(feature_IDPs, -c(n_eid, age)))
+
+```
+
+Display which IDPs are in the set
+```{r}
+
+disp_IDPs <- feature_IDPs %>%
+  filter(n_eid == 3769739) %>%
+  select(-c(n_eid, age)) %>%
+  pivot_longer(cols = everything(), names_to = "IDP", values_to = "value") %>%
+  select(IDP) %>%
+  left_join(IDP_name_table, by = "IDP") %>%
+  # Make it so total volume IDPs are really clear
+  mutate(map = case_when(
+    IDP == "X26514.2.0" ~ "total brain volume",
+    IDP == "X26518.2.0" ~ "total grey matter volume",
+    IDP == "total_wm" ~ "total white matter volume",
+    IDP == "X26527.2.0" ~ "total CSF volume",
+    TRUE ~ map)) %>%
+  group_by(MRI, map) %>%
+  tally() %>%
+  mutate(map = factor(map, levels = c("total brain volume", "total grey matter volume",
+                                       "total white matter volume", "total CSF volume",
+                                       "freesurfer_DKT", "freesurfer_ASEG", "weighted_mean", "P25"))) %>%
+  arrange(map) %>%
+  mutate(MRI = factor(MRI, levels = c("T1", "T2", "dMRI", "rfMRI"))) %>%
+  arrange(MRI)
+
+disp_IDPs
+
+```
+Save this final tally of the IDPs
+```{r}
+
+write.csv(disp_IDPs, file = paste0(model_version, "_feature_IDP_tally_", Sys.Date(), ".csv"))
+
+```
+
+Cole uses ICD-10 diagnosis to define healthy and non-healthy people
+
+We don't have ICD-10, but we do have two data fields in which participants rate their overall health
+2188 - Long-standing illness, disability or infirmity = longstanding
+2178 - Overall health rating = health_rating
+
+
+Use this to create a column called healthy with "healthy" or "non-healthy"
+Primary phenotype is the imaging visit, backfilled with baseline
+Cole also references diabetes and stroke history
+
+2178 uses data coding 100508
+"In general how would you rate your overall health?"
+1 = excellent, 2 = good, other values are less good or no answer
+
+2188 uses data coding 100349
+"Do you have any long-standing illness, disability or infirmity?"
+1 = Yes, 0 = No
+
+Diabetes (Data field 2443)
+"Has a doctor ever told you that you have diabetes?"
+Data coding 100349 (for data field 2443)
+1	Yes
+0	No
+-1	Do not know
+-3	Prefer not to answer
+
+Age at first stroke (Data field 4056)
+"What was your age when the stroke was first diagnosed?"
+NA responses mean no diagnosis of stroke
+-1 represents "Do not know"
+-3 represents "Prefer not to answer"
+
+These fields are processed in the covariates and imputation step
+
+10/14/24 there are still comments about stroke
+Not filtering on it anymore in this script since we added exclusion for stroke and other neurological diseases
+
+Filter down the healthy group by condition so we can see where people are removed
+Health status
+```{r}
+
+health_status <- un_scaled %>%
+  select(c(n_eid, health_rating, longstanding, diabetes)) %>%
+  filter(health_rating <= 2)
+
+```
+
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "Health rating <= 2", "N" = nrow(health_status)))
+
+```
+
+Longstanding illness
+```{r}
+
+health_status <- health_status %>%
+  filter(longstanding == 0)
+
+```
+
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "No longstanding illness", "N" = nrow(health_status)))
+
+```
+
+Diabetes
+```{r}
+
+health_status <- health_status %>%
+  filter(diabetes == 0)
+
+```
+
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "No diabetes", "N" = nrow(health_status)))
+
+```
+
+
+Make a column to distinguish participants with moderate alcohol consumption
+```{r}
+
+alcohol <- un_scaled %>%
+  mutate(light_drink = case_when(
+    # Filter OUT the people who do not fit moderate alcohol consumption criteria
+    alcohol_status == "Never" ~ 0,
+    alcohol_status == "Former" ~ 0,
+    week_drinks < 0.0001 ~ 0,
+    week_drinks >= drink_cutoff ~ 0,
+    TRUE ~ 1))
+  
+alcohol %>%
+  group_by(alcohol_status, light_drink) %>%
+  tally()
+
+```
+
+Add healthy and week drinks to feature IDPs
+```{r}
+
+health_status <- health_status %>%
+  mutate(healthy = 1)
+
+feature_IDPs <- feature_IDPs %>%
+  left_join(select(health_status, c(n_eid, healthy)), by = "n_eid") %>%
+  mutate(healthy = ifelse(is.na(healthy), 0, healthy)) %>%
+  left_join(select(alcohol, c(n_eid, light_drink)), by = "n_eid")
+
+```
+
+Get a subset of healthy participants with moderate alcohol consumption
+Then remove columns about healthy or light so they don't go into the model
+```{r}
+
+healthy_light <- feature_IDPs %>%
+  filter(healthy == 1) %>%
+  filter(light_drink == 1) %>%
+  select(-c(healthy, light_drink))
+
+```
+
+
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = paste0("Moderate alcohol consumption (", drink_cutoff ,"< per week)"), "N" = nrow(healthy_light)))
+
+```
+
+Pull out a subset of the healthy participants with light / moderate alcohol consumption  to use in train / test
+```{r}
+
+set.seed(1987)
+
+healthy_light_TT <- sample_n(healthy_light, sample_N)
+
+```
+
+We care about the number of "healthy light" participants who are left over to be included in our actual experimental set
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "Train / test subset",
+                                         "N" = nrow(healthy_light_TT)))
+
+```
+
+How many healthy light alcohol use people are left for analysis?
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "Healthy light in experimental",
+                                         "N" = nrow(healthy_light) - nrow(healthy_light_TT)))
+
+```
+
+
+#### Healthy Light model
+Train the model in the healthy light train test sample
+```{r}
+
+index <- sample(2, nrow(healthy_light_TT), replace = TRUE, prob = c(0.8, 0.2))
+table(index)
+
+# Split data into training/testing and keep imaging variables only
+train_data <- healthy_light_TT[index == 1, IDP_list]
+test_data <- healthy_light_TT[index == 2,  IDP_list]
+
+# Define objects with age labels for training and test sets
+train_labels <- healthy_light_TT[index == 1, "age"]
+test_labels <- healthy_light_TT[index == 2, "age"]
+
+```
+
+Save the n in the train and test sets
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "Train", "N" = nrow(train_data)))
+n_tracker <- rbind(n_tracker, data.frame("Step" = "Test", "N" = nrow(test_data)))
+
+# Grab eids in train and test to use for the demographics table
+train_eid <- healthy_light_TT[index == 1, "n_eid"]
+test_eid <- healthy_light_TT[index == 2, "n_eid"]
+
+```
+
+
+Cole only does scaling after splitting, notes that scaling parameters should be saved to apply to new data
+Note this if using IDPs processed with other versions of the main pipeline
+```{r}
+
+scaled.train_data <- scale(train_data, scale = TRUE, center = TRUE)
+scaling.parameters.center <- attr(scaled.train_data, "scaled:center")
+scaling.parameters.scale <- attr(scaled.train_data, "scaled:scale")
+scaled.test_data <- as.data.frame(scale(test_data, scaling.parameters.center, scaling.parameters.scale))
+scaled.train_data <- as.data.frame(scaled.train_data)
+
+```
+
+Functions to evaluate model accuracy
+Based on Cole but modified for my workflow
+
+```{r}
+
+get_metrics <- function(pred, labels, subset) {
+  # Function to calculate and return model metrics, creates a nice table
+  n <- length(pred)
+  r <- cor.test(labels, pred)$estimate
+  r.sq <- summary(lm(labels ~ pred))$r.squared
+  MAE <- mean(abs(pred - labels), na.rm = T)
+  age.bias <- cor.test(labels, (pred - labels))$estimate
+  results <- data.frame("subset" = rep(subset, 4),
+              "metric" = c("r", "R^2", "MAE", "age bias"),
+             "value" = c(r, r.sq, MAE, age.bias))
+  results$value <- formatC(results$value, format = "f", digits = 3)
+  results <- rbind(data.frame("subset" = c(subset),
+                              "metric" = c("n"),
+                              "value" = c(formatC(n, format = "d"))),
+                   results)
+  return(results)
+}
+
+```
+
+
+```{r}
+
+# Function modified from Cole
+# Make a plot to visualize age bias
+
+age_plot <- function(pred, test_labels, subset) {
+  ggplot() +
+    geom_abline(slope = 1, intercept = 0, color = "green", size = 0.8) +
+    geom_point(aes(x = test_labels, y = pred), size = 2.5, alpha = 0.2) +
+    geom_smooth(aes(x = test_labels, y = pred), method = "lm", col = "purple") +
+    labs(title = deparse(substitute(pred)), x = "Age (years)", y = "Brain-predicted age (years)") +
+    # Set x and y limits for consistent plotting
+    xlim(c(min(feature_IDPs$age), max(feature_IDPs$age))) +
+    ylim(c(min(feature_IDPs$age) - 10, max(feature_IDPs$age) + 10)) +
+    annotate(geom="text", x=50, y=85,
+           label=paste0("Age bias = ",
+                        pull(select(filter(get_metrics(pred, test_labels, subset), metric == "age bias"), value))),
+           color="purple", size = 5)
+}
+
+```
+
+## LASSO regression
+Using the glmnet package. Alpha = 1 is for LASSO penalisation (0 = ridge, 0.5 = elastic net).
+```{r}
+
+x.train <- as.matrix(scaled.train_data)
+dimnames(x.train) <- NULL
+y.train <- as.matrix(train_labels)
+
+## cross-validation for lambda
+set.seed(1987)
+lasso.fit.cv <- cv.glmnet(x = x.train, y = y.train,
+                          alpha = 1, family = "gaussian")
+
+```
+
+Plot results. The minimum lambda value is `r round(lasso.fit.cv$lambda.min,3)`, while the optimal lambda value (i.e., the highest value within 1 standard error of the minimum) is `r round(lasso.fit.cv$lambda.1se,3)`.
+```{r}
+
+lambda_fit_plot <- lasso.fit.cv %>%
+  tidy() %>%
+  mutate(log_lambda = log10(lambda)) %>%
+  ggplot(aes(x = log_lambda, y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high)) +
+  # Convert optimal lambda to log so plots in the right place
+  geom_vline(xintercept = log10(lasso.fit.cv$lambda.1se), color = "red", size = 0.8) +
+  ggtitle("Model MSE in 10 cross validations") +
+  xlab("λ (log transformed)") +
+  ylab("Model MSE") +
+  annotate(geom="text", x=-2.5, y=55,
+           label=paste0("Optimal λ = ", round(lasso.fit.cv$lambda.1se, digits = 3)),
+           color="red", size = 5)
+
+ggsave(
+  paste0(model_version, "_lambda_fit_plot_", Sys.Date(), ".png"),
+  lambda_fit_plot,
+  width = 6,
+  height = 4,
+  dpi = set_dpi)
+
+lambda_fit_plot
+
+```
+
+Save lambda for model metrics
+```{r}
+
+lambda <- lasso.fit.cv$lambda.1se
+lambda
+
+```
+
+### LASSO model performance on validation data
+Fit model using previously optimised (through CV) lambda value (1 SE value, not minimum).
+```{r}
+
+lasso.fit <- glmnet(x = x.train, y = y.train,
+                    alpha = 1, family = "gaussian", lambda = lasso.fit.cv$lambda.1se)
+lasso.pred <- predict(lasso.fit, newx = as.matrix(scaled.test_data))
+
+```
+
+Get metrics and visualize age bias before correcting for age bias
+
+```{r}
+
+get_metrics(lasso.pred, test_labels, "test")
+
+```
+
+Save the pre-correction lasso.fit result metrics into a table
+```{r}
+
+model_metrics <- get_metrics(lasso.pred, test_labels, "test")
+
+```
+
+Visualize age bias
+```{r}
+
+test_bias_before <- age_plot(lasso.pred, test_labels, "test") +
+  ggtitle("Chronological vs. predicted age in test subset\nBefore age bias correction")
+
+ggsave(
+  paste0(model_version, "_test_bias_before_", Sys.Date(), ".png"),
+  test_bias_before,
+  width = 6,
+  height = 4,
+  dpi = set_dpi)
+
+test_bias_before
+
+```
+
+
+
+Do the age bias correction
+## Correct for age bias
+Calculate age bias in initial test data.
+```{r}
+
+bias.model <- lm(lasso.pred ~ test_labels)
+bias.model$coefficients[1]
+bias.model$coefficients[2]
+
+```
+
+Subtract the intercept and then divide by the slope
+```{r}
+
+lasso.pred.corrected <- (lasso.pred - bias.model$coefficients[1]) / bias.model$coefficients[2]
+
+```
+
+Visualize age bias after correction
+```{r}
+
+test_bias_after <- age_plot(lasso.pred.corrected, test_labels, "test") +
+  ggtitle("Chronological vs. predicted age in test subset\nAfter age bias correction")
+
+ggsave(
+  paste0(model_version, "_test_bias_after_", Sys.Date(), ".png"),
+  test_bias_after,
+  width = 6,
+  height = 4,
+  dpi = set_dpi)
+
+test_bias_after
+
+```
+
+Capture model metrics in the train set for completeness
+```{r}
+
+lasso.pred.train <- predict(lasso.fit, newx = as.matrix(scaled.train_data))
+
+
+model_metrics <- rbind(model_metrics, get_metrics(lasso.pred.train, train_labels, "train"))
+
+```
+
+Code from Cole 2020 using bootstrapping to determine confidence intervals
+========================================================
+
+### Variable weightings and feature selection results
+```{r}
+LASSO.coefficient <- coef(lasso.fit, s = lasso.fit.cv$lambda.1se)[-1]
+var.coefs <- data.frame(IDP_list, LASSO.coefficient)
+non.zero_vars <- subset(var.coefs, var.coefs$LASSO.coefficient != 0)
+non.zero_vars$IDP_list <- factor(non.zero_vars$IDP_list)
+```
+Out of the original `r dim(var.coefs)[1]` variables, the LASSO regression set `r length(non.zero_vars$IDP_list)` to non-zero, thus `r dim(var.coefs)[1] - length(non.zero_vars$IDP_list)` variables were removed.
+
+## Bootstrap LASSO
+Bootstrap 95% confidence intervals. Uses the boot package.
+
+#### Function to obtain LASSO regression coefficients
+Essential to convert coefficients to vector that stores zeros.
+```{r}
+lasso.coef <- function(data, indices) {
+  d <- data[indices,]
+  fit <- glmnet(x = d[,-1], y = d[,1],
+                    alpha = 1, family = "gaussian", lambda = lasso.fit.cv$lambda.1se)
+  return(coef(fit)[,1])
+}
+```
+
+#### Run bootstrap with n replications
+Normal printing and plotting of results doesn't work for high-dimensional datasets.
+Load data file if it already exists.
+```{r}
+if (file.exists(paste0(model_version, ".lasso.boot.out.rda"))) {
+  load(paste0(model_version, ".lasso.boot.out.rda"))
+  cat("loading existing bootstrap file")
+  } else {
+    cat("running bootstraps")
+    boot.out <- boot(data = cbind(y.train, x.train), statistic = lasso.coef, R = 1000)
+    save(boot.out, file = paste0(model_version, ".lasso.boot.out.rda"))
+  }
+```
+There were `r table(boot.out$t0[-1] > 0 | boot.out$t0[-1] < 0)[2]` non-zero coefficients.
+
+Check histogram of bootstrap coefficients for top variable by way of example.
+```{r}
+ggplot() +
+  geom_histogram(bins = 100, aes(boot.out$t[,which.max(abs(boot.out$t0[-1])) + 1]),
+                 fill = "darkgoldenrod2",
+                 colour = "black",
+                 lwd = 0.25) +
+  xlab("Top variable bootstrapped coefficients") +
+  theme_cowplot()
+```
+
+#### Function for getting CIs from vector
+```{r}
+ci.vector <- function(index, boot.object, ci.type) {
+  x <- boot.ci(boot.object, type = ci.type, index = index)
+  return(x[4])
+}
+```
+
+Use my ci.vector() function (defined above) to derive confidence intervals. 
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+n <- length(boot.out$t0)
+boot.ci.out <- sapply(1:n, ci.vector, boot.object = boot.out, ci.type = "basic")
+x <- boot.out$t0[1:n]
+y <- data.frame(t(matrix(unlist(boot.ci.out), ncol = n)))[4:5]
+ci.df <- cbind(x, y)
+names(ci.df) <- c("coef", "l.ci", "u.ci")
+```
+
+Identify variables with confidence intervals that do not overlap zero.
+```{r paged.print=FALSE}
+# drop intercept from plot using [-1] in vector ci.df$l.ci and ci.df$u.ci (i.e., the intercept is the top row)
+sig.vars.index <- which(ci.df$l.ci[-1] > 0 | ci.df$u.ci[-1] < 0)
+sig.vars.list <- IDP_list[sig.vars.index]
+sig.vars.df <- ci.df[sig.vars.index + 1,] ## add 1 to omit intercept row
+sig.vars.df <- cbind(sig.vars.list, round(sig.vars.df,3))
+kable(sig.vars.df[order(abs(sig.vars.df$coef), decreasing = T),]) %>% kable_styling(bootstrap_options = c("striped","condensed", "responsive", full_width = F, position = "centre"), fixed_thead = list(enabled = T, background = "lightgrey"))
+```
+
+
+```{r warning=FALSE}
+## sort dataset by coefficient
+ci.df2 <- ci.df[order(ci.df$coef, decreasing = T),]
+# drop intercept from plot using [-1,] in data.frame ci.df (i.e., the intercept is the top row)
+plot(ci.df2[-1,1], ylim = c(min(ci.df2[-1,2]), max(ci.df2[-1,3])),
+     pch = 20, col = "darkgoldenrod2", ylab = "LASSO coefficient") + 
+  arrows(x0 = 1:(n - 1), y0 = ci.df2[-1,2], y1 = ci.df2[-1,3],
+         length = 0.02, angle = 90, code = 3, col = "grey") +
+  abline(h = 0, type = 2)
+```
+
+#### Plot only the significant variables
+There are `r length(sig.vars.list)` variables with CIs that don't overlap zero.
+```{r warning=FALSE}
+## sort dataset by coefficient
+sig.vars.df2 <- sig.vars.df[order(sig.vars.df$coef, decreasing = T),]
+opar <- par() 
+par(mar = c(15, 4, 1, 2))
+axis_labels <- gsub("_f....._2_0", "", sig.vars.df2[,1])
+plot(sig.vars.df2$coef, ylim = c(min(sig.vars.df2$l.ci),max(sig.vars.df2$u.ci)),
+     pch = 20, col = "darkgoldenrod2", ylab = "LASSO coefficient", xaxt = "n", xlab = "") + 
+  arrows(x0 = 1:dim(sig.vars.df2)[1], y0 = sig.vars.df2$l.ci, y1 = sig.vars.df2$u.ci,
+         length = 0.02, angle = 90, code = 3, col = "grey") +
+  abline(h = 0, type = 2)
+axis(side = 1, at = 1:length(sig.vars.list), labels = axis_labels, las = 2, cex.axis = 0.8)
+par(opar)
+```
+
+#####Vera
+
+What are the names / MRI of the significant variables?
+```{r}
+
+load(paste0(output_path, "IDP_names_table_", run_date, ".RData"))
+
+named_sig_vars <- sig.vars.df %>%
+  dplyr::rename("IDP" = sig.vars.list) %>%
+  left_join(IDP_name_table, by = "IDP") %>%
+  arrange(desc(coef))
+
+named_sig_vars
+
+```
+
+Arrange named sig vars
+```{r}
+
+named_sig_vars <- named_sig_vars %>%
+  mutate(map = ifelse(map == "weighted_mean", "weighted mean", map)) %>%
+  mutate(MRI = factor(MRI, levels = c("T1", "T2", "dMRI", "rfMRI"))) %>%
+  mutate(map = factor(map, levels = c("global", "freesurfer_ASEG", "freesurfer_DKT", "weighted mean"))) %>%
+  mutate(dMRI = factor(dMRI, levels = c("FA", "MD", "ISOVF", "ICVF"))) %>%
+  arrange(desc(coef)) %>%
+  arrange(hemisphere) %>%
+  arrange(dMRI) %>%
+  arrange(map) %>%
+  arrange(MRI) %>%
+  select(IDP, IDP_name, MRI, map, dMRI, coef, l.ci, u.ci) %>%
+  mutate(IDP = gsub("X", "", IDP)) %>%
+  mutate(IDP = gsub(".2.0", "", IDP)) %>%
+  mutate(IDP = gsub("P25_", "", IDP)) %>%
+  mutate(IDP_name = gsub("_dim_25752_2_0_v", " ", IDP_name)) %>%
+  mutate(IDP_name = gsub("_", " ", IDP_name))
+
+```
+
+```{r}
+
+save(named_sig_vars, file = paste0(model_version, "_sig_vars_", Sys.Date(), ".RData"))
+write.csv(named_sig_vars, file = paste0(model_version, "_sig_vars_", Sys.Date(), ".csv"))
+
+```
+
+Make a summary of the significantly predictive IDPs
+```{r}
+
+sig_vars_tally <-  named_sig_vars %>%
+  # Make it so total volume IDPs are really clear
+  #mutate(map = case_when(
+  #  IDP == "X26514.2.0" ~ "total brain volume",
+  #  IDP == "X26518.2.0" ~ "total grey matter volume",
+  #  IDP == "total_wm" ~ "total white matter volume",
+  #  IDP == "X26527.2.0" ~ "total CSF volume",
+  #  TRUE ~ map)) %>%
+  group_by(MRI, map) %>%
+  tally() %>%
+  mutate(MRI = factor(MRI, levels = c("T1", "T2", "dMRI", "rfMRI"))) %>%
+  arrange(MRI)
+
+sig_vars_tally
+
+```
+
+
+
+```{r}
+
+save(sig_vars_tally, file = paste0(model_version, "_sig_vars_tally_", Sys.Date(), ".RData"))
+write.csv(sig_vars_tally, file = paste0(model_version, "_sig_vars_tally_", Sys.Date(), ".csv"))
+
+```
+
+
+Also output the entire set of features with CI, regardless of significance
+```{r}
+
+# Features are in the order of IDP_list
+# Drop the intercept and then bind on IDP list
+all_feature_CI <- ci.df[2:nrow(ci.df),]
+
+all_feature_CI <- all_feature_CI %>%
+  cbind(IDP_list) %>%
+  relocate(IDP_list, .before = coef) %>%
+  dplyr::rename("IDP" = IDP_list) %>%
+  left_join(IDP_name_table, by = "IDP")
+
+save(all_feature_CI, file = paste0(model_version, "_all_CI_", Sys.Date(), ".RData"))
+
+```
+
+
+### Apply the model to the experimental subset
+Everyone not in train / test is in experimental subset
+```{r}
+
+experimental_subset <- feature_IDPs %>%
+  filter(! n_eid %in% healthy_light_TT$n_eid)
+
+```
+
+
+```{r}
+
+experimental.labels <- experimental_subset$age
+
+```
+
+Save n from the experimental subset
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "Experimental", "N" = nrow(experimental_subset)))
+
+```
+
+Scale new subjects variables using the scaling parameters from the training set.
+```{r}
+scaled.experimental.test <- as.data.frame(scale(experimental_subset[,IDP_list], scaling.parameters.center, scaling.parameters.scale))
+```
+
+
+Run the lasso model on the experimental participants
+```{r}
+
+lasso.experimental.pred <- as.numeric(predict(lasso.fit, newx = as.matrix(scaled.experimental.test)))
+
+```
+
+Capture model metrics before applying age bias correction
+```{r}
+
+exp_metrics <- get_metrics(lasso.experimental.pred, experimental.labels,
+                                  "experimental subset")
+exp_metrics
+
+```
+
+Add to model metrics
+```{r}
+
+model_metrics <- model_metrics %>%
+  rbind(exp_metrics)
+
+```
+
+
+Visualize age bias before correction
+```{r}
+
+exp_bias_before <- age_plot(lasso.experimental.pred, experimental.labels, "experimental") +
+  ggtitle("Chronological vs. predicted age in experimental subset\nBefore age bias correction")
+
+ggsave(
+  paste0(model_version, "_exp_bias_before_", Sys.Date(), ".png"),
+  exp_bias_before,
+  width = 6,
+  height = 4,
+  dpi = set_dpi)
+
+exp_bias_before
+
+```
+
+
+
+## Correct for age bias
+Calculate age bias in initial test data.
+```{r}
+bias.model <- lm(lasso.pred ~ test_labels)
+bias.model$coefficients[1]
+bias.model$coefficients[2]
+```
+
+Apply correction to experimental data.
+Subtract the intercept and then divide by the slope
+```{r}
+
+lasso.experimental.pred.corrected <- (lasso.experimental.pred - bias.model$coefficients[1]) / bias.model$coefficients[2]
+
+```
+
+Visualize age bias after correction
+```{r}
+
+exp_bias_after <- age_plot(lasso.experimental.pred.corrected, experimental.labels, "experimental") +
+  ggtitle("Chronological vs. predicted age in experimental subset\nAfter age bias correction")
+
+ggsave(
+  paste0(model_version, "_exp_bias_after_", Sys.Date(), ".png"),
+  exp_bias_after,
+  width = 6,
+  height = 4,
+  dpi = set_dpi)
+
+exp_bias_after
+
+```
+
+
+Add predicted ages back to the experimental subset and calculate brain PAD
+```{r}
+
+experimental_brainPAD <- experimental_subset %>%
+  select(n_eid, age) %>%
+  cbind(lasso.experimental.pred.corrected) %>%
+  dplyr::rename("pred_age" = lasso.experimental.pred.corrected) %>%
+  mutate(brainPAD = pred_age - age)
+
+```
+
+
+Print lambda
+```{r}
+
+lambda
+
+```
+
+Save brain age model results, model metrics in subsets, n tracker, and filtered eid
+```{r}
+
+save(experimental_brainPAD, file = paste0(output_path, model_version ,"_brainPAD_", Sys.Date(), ".RData"))
+
+```
+
+Stitch n features (feature IDPs) into the model metrics
+```{r}
+
+n_IDP <- data.frame("subset" = c("all", "all"),
+                    "metric" = c("n features", "lambda"),
+                    "value" = c(nrow(all_feature_CI), # Ncol feature IDPs includes non IDP columns like eid, health, etc.
+                                lambda)) 
+
+model_metrics = rbind(n_IDP, model_metrics)
+
+
+```
+
+```{r}
+
+model_metrics <- model_metrics %>%
+  mutate(subset = factor(subset, levels = c("all", "train", "test", "experimental subset"))) %>%
+  arrange(subset) %>%
+  mutate(value = as.numeric(value)) %>%
+  mutate(value = ifelse(value < 10, round(value, digits = 2), round(value)))
+
+model_metrics
+
+write.csv(model_metrics, file = paste0(model_version, "_model_metrics_", Sys.Date(), ".csv"))
+
+```
+
+View the n
+```{r}
+
+n_tracker
+
+```
+
+Make the brainPAD by drinking category table
+
+Load genetic PCs
+```{r}
+
+load(paste0(output_path, "genetic_PC_", run_date, ".RData"))
+
+```
+
+Load the processed imaging covariates
+From step 2 of the pipeline
+```{r}
+
+load(paste0(output_path, "/processed_imaging_covariates_", "2024-07-29", ".RData"))
+
+```
+
+Load the covariates that have been processed with backfilling imaging data with baseline data and then imputation
+From step 3 of the pipeline
+```{r}
+
+load(paste0(output_path, "/imputed_covariates_", run_date, ".RData"))
+
+```
+
+Combine the tables to make a regression table
+Create a column for scaled brainPAD
+```{r}
+
+regression_table <- imputation_results %>%
+  select(-c(sex, age, date)) %>%
+  filter(n_eid %in% experimental_subset$n_eid) %>%
+  left_join(genetic_PC, by = "n_eid") %>%
+  left_join(imaging_covariates, by = "n_eid") %>%
+  left_join(select(experimental_brainPAD, -age), by = "n_eid") %>%
+  mutate(scaled_brainPAD = scale(brainPAD, center = TRUE, scale = TRUE))
+  
+rm(imputation_results)
+rm(imaging_covariates)
+rm(genetic_PC)
+gc()
+
+```
+
+Create the alcohol category column
+Use the week drinks variable in the covariates to create bins
+If changing this make sure to also change in demographics or the numbers will not line up!
+```{r}
+
+regression_table <- regression_table %>%
+  mutate(drink_group = case_when(
+    alcohol_status == "Never" ~ 6,
+    alcohol_status == "Former" ~ 6,
+    week_drinks <= 1 ~ 0, # Current alcohol consumption with less than 1 drink per week are the reference group
+    week_drinks <= 7 ~ 1,
+    week_drinks <= 14 ~ 2,
+    week_drinks <= 21 ~ 3,
+    week_drinks <= 28 ~ 4,
+    week_drinks > 28 ~ 5))
+
+
+```
+
+
+Note that the < 1 group includes some participants who indicated they do drink (current) in data field 1558 but who end up with calculated week drinks of 0
+
+Factor drink groups, and specify that 0 (lightest drinking group) is the reference level
+```{r}
+
+regression_table$drink_group <- factor(regression_table$drink_group)
+#regression_table$drink_group <- relevel(regression_table$drink_group, ref = 0)
+
+class(regression_table$drink_group)
+levels(regression_table$drink_group)
+
+```
+
+Check the N in each drinking category
+```{r}
+
+group_n <- regression_table %>%
+  group_by(drink_group) %>%
+  tally()
+
+group_n
+
+```
+
+1/23/24 checked and this matches the demographics table
+
+Do regression (just one for brain PAD)
+
+```{r}
+
+covariates <-c("sex", "age", "scaled_pack_years", "income", "education_years",
+               "BMI", "diabetes", "systolic_BP", "diastolic_BP", "health_rating", "longstanding",
+               "head_size", "site", "date", "rfMRI_motion",
+               "PC_1", "PC_2", "PC_3", "PC_4", "PC_5", "PC_6", "PC_7", "PC_8", "PC_9", "PC_10")
+
+predictor <- "drink_group"
+
+```
+
+
+```{r}
+
+regression <- glm(formula(paste("regression_table$brainPAD ~",
+                                             paste(c(predictor, covariates), collapse = "+"))),
+                                              family = "gaussian", data = regression_table)
+
+```
+
+Clean up the regression results
+```{r}
+
+result_table <- tidy(regression)
+result_table
+
+```
+
+Make the results into a nice table showing the relationship
+
+```{r}
+
+brain_PAD_regression <- result_table %>%
+  filter(grepl("drink_group", term)) %>%
+  # Add a row to account for the reference group (infrequent, < 1)
+  rbind(data.frame("term" = c("0"), "estimate" = c(0), std.error = c(NA), statistic = c(NA), "p.value" = c(NA))) %>%
+  mutate(drink_group = gsub("drink_group", "", term)) %>%
+  # Factor and order
+  mutate(drink_group = factor(drink_group, levels = c(6, 0, 1, 2, 3, 4, 5))) %>%
+  arrange(drink_group) %>%
+  # Add readable group names
+  mutate(week_drinks = case_when(
+    drink_group == 6 ~ "0 (never)",
+    drink_group == 0 ~ "<=1*",
+    drink_group == 1 ~ ">1-7",
+    drink_group == 2 ~ ">7-14",
+    drink_group == 3 ~ ">14-21",
+    drink_group == 4 ~ ">21-28",
+    drink_group == 5 ~ ">28")) %>%
+  left_join(group_n, by = "drink_group") %>%
+  # Calculate confidence intervals
+  mutate(interval = 1.86 * std.error) %>%
+  mutate(lower = estimate - interval) %>%
+  mutate(upper = estimate + interval) %>%
+  select(-c(term, statistic, std.error, drink_group, interval)) %>%
+  relocate(estimate, .after = n) %>%
+  relocate(p.value, .after = upper) %>%
+  mutate_at(vars(estimate, lower, upper), ~formatC(.x, digits = 2, format = "f")) %>%
+  mutate(p.value = ifelse(p.value > 0.009, formatC(p.value, digits = 2, format = "f"),
+                                                           formatC(p.value, digits = 2, format = "e"))) %>%
+  dplyr::rename("Drinks per week" = week_drinks, "brain-PAD (years)" = estimate,
+                "Lower bound" = lower, "Upper bound" = upper, "p-value" = p.value)
+  
+
+brain_PAD_regression %>%
+  kable(caption = paste0("Brain-PAD associated with drinking category while controlling for covariates")) %>%
+  kable_classic(full_width = F, html_font = "Cambria") %>%
+  footnote(general = paste0("*Reference category is current light alcohol consumption with less than 1 drink per week",
+                            "\nN=", nrow(regression_table)),
+           general_title = "")
+
+```
+
+Save as an excel file to make a nice table
+```{r}
+
+write.csv(brain_PAD_regression, file = paste0(model_version, "_brainPAD_", Sys.Date(), ".csv"))
+
+```
+
+
+For comparison make the simple table that just has mean brain-PAD without any regression or controlling
+```{r}
+
+PAD_categories <- regression_table %>%
+  select(brainPAD, drink_group) %>%
+  group_by(drink_group) %>%
+  summarise(n = n(), mean = mean(brainPAD), sd = sd(brainPAD)) %>%
+  mutate(conf = 1.96 * (sd / sqrt(n))) %>%
+  mutate(lower = mean - conf) %>%
+  mutate(upper = mean + conf) %>%
+  # Factor and order
+  mutate(drink_group = factor(drink_group, levels = c(6, 0, 1, 2, 3, 4, 5))) %>%
+  arrange(drink_group) %>%
+  # Add readable group names
+  mutate(week_drinks = case_when(
+    drink_group == 6 ~ "0 (never)",
+    drink_group == 0 ~ "<=1*",
+    drink_group == 1 ~ ">1-7",
+    drink_group == 2 ~ ">7-14",
+    drink_group == 3 ~ ">14-21",
+    drink_group == 4 ~ ">21-28",
+    drink_group == 5 ~ ">28")) %>%
+  mutate(across(c(mean, lower, upper), ~formatC(.x, digits = 2, format = "f"))) %>%
+  select(-c(drink_group, sd, conf)) %>%
+  relocate(week_drinks, .before = n) %>%
+  dplyr::rename("Drinks per week" = week_drinks, "Brain-PAD (years)" = mean, "Lower bound" = lower,
+                "Upper bound" = upper)
+
+
+PAD_categories %>%
+  kable(caption = paste0("Mean brain-PAD in drinking categories")) %>%
+  kable_classic(full_width = F, html_font = "Cambria") %>%
+  footnote(general = paste0("Simple group average, no controlling for covariates",
+                            "\nN=", nrow(regression_table)),
+           general_title = "")
+
+```
+
+Save as an excel file to make a nice table
+```{r}
+
+#write.csv(PAD_categories, file = paste0(model_version, "_brainPAD_mean_", Sys.Date(), ".csv"))
+
+```
+
+Do another regression for alcohol only predicting IDPs, then alcohol + brainPAD
+
+
+Define a function for regression (will run on all the different sets of IDPs)
+
+```{r}
+
+
+do_IDP_regression <- function(IDP_table, vars_list, regression_table) {
+  # Function to perform regression using covariates in the regression table on all the IDPs in the supplied IDP table
+  # Will return a table with IDP, alcohol estimate and P value, and pack years estimate and P value
+  
+  # Join the IDPs onto the regression table
+  # Changed this to inner join, R has been sneakily dropping my n the WHOLE time
+  regression_table <- inner_join(IDP_table, regression_table, by = "n_eid", all = FALSE)
+  regression_table <- na.omit(regression_table)
+  # Print the N so user is alerted if this happens
+  print(paste0("IDP N=", nrow(IDP_table), ", regression N=", nrow(regression_table)))
+  
+  IDP_names <- colnames(IDP_table)
+  IDP_names <- IDP_names[IDP_names != "n_eid"]
+  
+  regression <- lapply(IDP_names, function(x) glm(formula(paste("unlist(regression_table[,x]) ~",
+                                             paste(vars_list, collapse = "+"))),
+                                              family = "gaussian", data = regression_table))
+  regression <- lapply(regression, tidy)
+  
+  regression_results <- data.frame("alcohol_beta" = c(), "alcohol_p" = c())
+
+  for (n in 1:length(regression)) {
+    
+    IDP <- IDP_names[n]
+    summary_tibble <- regression[[n]]
+    
+    summary_tibble <- summary_tibble %>%
+      mutate(term = gsub("\\(", "", term)) %>%
+      mutate(term = gsub("\\)", "", term)) %>%
+      mutate(term = tolower(term)) %>%
+      select(term, estimate, std.error, p.value) %>%
+      pivot_longer(cols = c(estimate, std.error, p.value), names_to = "stat", values_to = "value")
+    
+    summary_tibble <- summary_tibble %>%
+      mutate(col_name = case_when(
+      (stat == "estimate") ~ paste0(term, "_beta"),
+      (stat == "std.error") ~ paste0(term, "_se"),
+      (stat == "p.value") ~ paste0(term, "_p"))) %>%
+      select(col_name, value) %>%
+      pivot_wider(names_from = col_name, values_from = value)
+    
+    new_row <- data.frame("IDP" = IDP)
+    
+    new_row <- cbind(new_row, summary_tibble)
+    
+    
+    regression_results <- rbind(regression_results, new_row)
+    
+  }
+  
+
+  return(regression_results)
+}
+
+
+```
+
+
+Scale brainPAD
+```{r}
+
+regression_table <- regression_table %>%
+  mutate(scaled_brainPAD = scale(brainPAD, center = TRUE, scale = TRUE))
+
+```
+
+
+Set up the list of covariates (updated 7/25/24)
+```{r}
+
+covariates <-c("sex", "age", "scaled_pack_years", "income", "education_years",
+               "BMI", "diabetes", "systolic_BP", "diastolic_BP", "health_rating", "longstanding",
+               "head_size", "site", "date", "rfMRI_motion",
+               "PC_1", "PC_2", "PC_3", "PC_4", "PC_5", "PC_6", "PC_7", "PC_8", "PC_9", "PC_10")
+
+```
+
+Load IDPs and perform regression
+```{r}
+
+load(paste0(output_path, "ukbio_IDP_", run_date, ".RData"))
+
+```
+
+Pull out the total volume measures
+```{r}
+
+total_volume_IDPs <- c("X26514.2.0", "X26518.2.0", "X26527.2.0", "total_wm")
+
+total_volumes <- ukbio_IDP %>%
+  select(c(n_eid, all_of(total_volume_IDPs)))
+
+```
+
+```{r}
+
+predictors <- c("week_drinks")
+
+```
+
+
+```{r}
+
+alcohol_model <- do_IDP_regression(total_volumes, c(predictors, covariates), regression_table)
+
+```
+
+Now scale the IDPs for the rest of the analysis
+```{r}
+
+ukbio_IDP <- ukbio_IDP %>%
+  select(-all_of(total_volume_IDPs)) %>%
+  mutate_at(vars(-n_eid), ~scale(.x, center = TRUE, scale = TRUE))
+
+```
+
+
+Bind the expanded IDP information to the tables
+```{r}
+
+alcohol_model <- left_join(alcohol_model, IDP_name_table, by = "IDP")
+
+```
+
+Save the regression results
+```{r}
+
+save(alcohol_model, file = paste0(output_path, model_version, "_alcohol_model_", Sys.Date(), ".RData"))
+
+```
+
+
+=================================================================
+Alcohol and brainPAD model
+
+```{r}
+
+predictors <- c("week_drinks", "brainPAD")
+
+```
+
+
+```{r}
+
+alcohol_brainPAD_model <- do_IDP_regression(total_volumes, c(predictors, covariates), regression_table)
+
+```
+
+
+Bind the expanded IDP information to the tables
+```{r}
+
+alcohol_brainPAD_model <- left_join(alcohol_brainPAD_model, IDP_name_table, by = "IDP")
+
+```
+
+Save the regression results
+```{r}
+
+save(alcohol_brainPAD_model, file = paste0(output_path, model_version, "_alcohol_brainPAD_model_", Sys.Date(), ".RData"))
+
+```
+
+Make a table to show the associations of alcohol and brainpad with the total volumes
+
+```{r}
+
+table_IDPs <- c("X26514.2.0", "X26518.2.0", "total_wm", "X26527.2.0", "total_cortex", "X26517.2.0")
+
+```
+
+"Controlling" appears twice here meaning different things
+Controlled IDPs have total brain volume (26515) in the regression model
+BP beta and p are from the regression model which has brain-PAD (controlling for overall age difference)
+
+```{r}
+
+total_brainPAD <- alcohol_brainPAD_model %>%
+  filter(IDP %in% table_IDPs) %>%
+  select(IDP, week_drinks_beta, week_drinks_p) %>%
+  dplyr::rename("bp_week_drinks_beta" = week_drinks_beta, "bp_week_drinks_p" = week_drinks_p)
+
+total_volume_table <- alcohol_model %>%
+  filter(IDP %in% table_IDPs) %>%
+  select(IDP, week_drinks_beta, week_drinks_p) %>%
+  left_join(total_brainPAD, by = "IDP") %>%
+  mutate(IDP = case_when(
+    IDP == "X26514.2.0"	 ~ "total brain volume",
+    IDP == "X26518.2.0"	 ~ "total grey matter volume",
+    IDP == "total_wm" ~ "total white matter volume",
+    IDP == "X26527.2.0" ~ "total CSF volume",
+    IDP == "total_cortex" ~ "total cortical volume",
+    IDP == "X26517.2.0" ~ "total subcortical volume")) %>%
+  mutate(IDP = factor(IDP, levels = c("total brain volume",
+                                                        "total grey matter volume",
+                                                        "average cortical thickness",
+                                                        "total white matter volume",
+                                                        "total CSF volume",
+                                      "total cortical volume",
+                                      "total subcortical volume"))) %>%
+  arrange(IDP) %>%
+  
+  # Get % explained by adding brainPAD
+  mutate(Explained = week_drinks_beta - bp_week_drinks_beta) %>%
+  mutate(percent_exp = Explained / week_drinks_beta * 100) %>%
+  
+  # Format
+  mutate_at(vars(week_drinks_beta, bp_week_drinks_beta, Explained), ~formatC(.x, digits = 2, format = "f")) %>%
+  mutate(percent_exp = round(percent_exp)) %>%
+  mutate_at(vars(week_drinks_p, bp_week_drinks_p), ~ifelse(.x > 0.009, formatC(.x, digits = 2, format = "f"),
+                                                           formatC(.x, digits = 2, format = "e")))
+
+total_volume_table
+
+```
+
+Save as an excel file to make a nice table
+```{r}
+
+write.csv(total_volume_table, file = paste0(model_version, "_total_volume_table_", Sys.Date(), ".csv"))
+
+```
+
+Save the n_tracker
+```{r}
+
+save(n_tracker, file = paste0(output_path, model_version, "_n_tracker_", Sys.Date(), ".RData"))
+write.csv(n_tracker, file = paste0(model_version, "_n_tracker_", Sys.Date(), ".csv"))
+
+```
+
+Also save list of n_eid in train and test
+```{r}
+
+experimental_eid <- experimental_subset$n_eid
+train_test_eid <- healthy_light_TT$n_eid
+
+save(experimental_eid, file = paste0(output_path, "experimental_eid_", Sys.Date(), ".RData"))
+save(train_test_eid, file = paste0(output_path, "train_test_eid_", Sys.Date(), ".RData"))
+save(train_eid, file = paste0(output_path, "train_eid_", Sys.Date(), ".RData"))
+save(test_eid, file = paste0(output_path, "test_eid_", Sys.Date(), ".RData"))
+
+```
+
+

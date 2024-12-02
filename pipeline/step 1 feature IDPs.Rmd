@@ -1,0 +1,374 @@
+---
+title: "Pipeline Step 1 - Filter participants and import imaging data"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+```{r}
+library(dplyr) # Run install.packages("tidyverse") to get this
+library(tidyr) # Run install.packages("tidyr") to get this
+library(ggplot2)
+library("reshape") # Run install.packages("reshape") to get this
+library(kableExtra) # Run install.packages("kableExtra")
+library(viridis)
+library(forcats)
+
+```
+
+Set the date to reference
+```{r}
+
+run_date <- "2024-11-13"
+
+```
+
+Set the filepaths for input and output
+ENSURE THIS IS A LOCATION SUITABLE FOR STORAGE OF UKB DATA
+```{r}
+
+input_path <- # data set storage location
+
+output_path <- # script outputs storage location
+
+```
+
+Initialize a table to track N as the data set is processed
+```{r}
+
+n_tracker <- data.frame(matrix(ncol = 2, nrow = 0))
+colnames(n_tracker) <- c("Step", "N")
+
+```
+
+Import imaging data
+Import the imaging data
+
+Import the file of IDPs
+Updated .csv with 45k participant from Janine via Yoonhoo on 3/7/23
+
+```{r}
+
+ukbio_IDP <- read.csv(file = paste0(input_path, "45k_IDP_visit1_3-7-23.csv"))
+
+```
+
+Capture n in the full imaging set
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "Imaging cohort", "N" = nrow(ukbio_IDP)))
+
+```
+
+No rfMRI ICAs
+
+
+Replace the imaging eid with the phenotype eid so they will match all the way through
+On 7/30/21 Yoonhoo emailed me a text file that matches one to the other. Import this and convert the IDs.
+
+On 8/30/21 we got an expanded imaging data set from Janine.
+Louis was able to get a new matching file that includes more of the new imaging participants.
+
+The column entitled ukb47267_ID_1 contains the IDs present in the imaging set.
+The column ukb48123_ID_1 is the IDs in the phenotype set.
+
+Spring 2024 got a new eid matching text file from Louis, now can match nearly all 42k eid
+
+```{r}
+
+ID_key <- read.table(file = paste0(input_path, "/ukb47267_to_ukb48123_IDs.txt"), sep = " ", header = TRUE)
+
+ID_key <- dplyr::rename(ID_key, pheno_eid = ukb48123_ID_1, eid = ukb47267_ID_1)
+
+```
+
+
+Now join these columns into the imaging data over ukb47267_ID_1 (eid)
+```{r}
+ukbio_IDP <- right_join(ID_key, ukbio_IDP, by = "eid")
+
+```
+
+
+Filter out the patients who are missing an eid - we cannot match them to the phenotypes
+```{r}
+
+ukbio_IDP <- ukbio_IDP %>%
+  filter(! is.na(pheno_eid))
+
+```
+
+After performing this step 36896 observations remain in the imaging data set.
+Update the n tracker
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "Matched phenotype eid", "N" = nrow(ukbio_IDP)))
+
+```
+
+Remove the imaging eid (no longer needed) and rename the pheno_eid so it will match the phenotyping and covariates
+
+```{r}
+
+ukbio_IDP <- ukbio_IDP %>%
+  select(! eid) %>%
+  dplyr::rename("n_eid" = "pheno_eid")
+
+```
+
+Filter out withdrawn participants
+Got a new list of withdrawn participants in Sep 2023
+UKB_withdrawn_9-5-23
+```{r}
+
+withdrawn_ID <- read.csv(paste0(input_path, "UKB_withdrawn_9-5-23.csv"))
+ukbio_IDP <- ukbio_IDP %>%
+  filter(! ukbio_IDP$n_eid %in% withdrawn_ID$X1038692)
+
+```
+
+Save the n
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = "Withdrawn removed", "N" = nrow(ukbio_IDP)))
+
+```
+
+
+======Handle missing data in the imaging IDPs================================================
+Do not normalize at this step, we normalize after defining train / test set
+
+Import the IDP names file to allow exploring the IDPs by MRI type, etc.
+```{r}
+
+load(paste0(output_path, "IDP_names_table_", run_date, ".RData"))
+
+```
+
+
+Filter for only the IDPs that are part of this analysis
+Defining a "keep" column and filtering on that is the most consistent way to select all the correct IDPs
+```{r}
+
+IDP_name_table <- IDP_name_table %>%
+  # Define what to keep
+  mutate(keep = case_when(
+    map == "P25" ~ 1, # Keep the partial corr 25 rfMRI IDPS
+    
+    # Remove QC measures
+    MRI == "QC" ~ 0,
+    region == "QC" ~ 0,
+    
+    # Fix some specific cases
+    numeric_IDP <= 25010 ~ 0,
+    IDP == "X26568.2.0" ~ 0, # QC measure for aseg
+    IDP == "X26599.2.0" ~ 0, # QC measure for aseg
+    
+    # Select which global measures are reported and remove others
+    IDP == "X26514.2.0" ~ 1, # total brain volume
+    IDP == "X26518.2.0" ~ 1, # total grey matter volume
+    IDP == "total_wm" ~ 1, # total white matter volume
+    IDP == "X26527.2.0" ~ 1, # total CSF volume
+    IDP == "X26528.2.0" ~ 0, # volume of white matter hypOintensities
+    IDP == "X25781.2.0" ~ 0, # volume of white matter hypERintensities
+    region == "global" ~ 0,
+    
+    # Remove from ASEG regions which are mis-classified
+    IDP %in% c("X26548.2.0", "X26579.2.0") ~ 0,
+    
+    # Address general groups
+    dimension == "mean_intensity" ~ 0,
+    
+    map == "FAST" ~ 0,
+    region == "cerebellum" ~ 1, # Ensure cerebellum volumes are included
+    
+    map == "freesurfer_ASEG" ~ 1,
+    map == "freesurfer_DKT" ~ 1,
+    MRI == "T2" ~ 1,
+    map == "skeleton" ~ 0,
+    dMRI == "FA" ~ 1,
+    dMRI == "MD" ~ 1,
+    dMRI == "ICVF" ~ 1,
+    dMRI == "ISOVF" ~ 1,
+    TRUE ~ 0)) %>%
+  # Filter out the IDPs we are not looking at in this analysis
+  filter(keep == 1)
+
+```
+
+The IDPs with mis-classified dimension:
+X26548.2.0	Mean intensity of Accumbens-area (left hemisphere)			
+X26564.2.0	Volume of Accumbens-area (left hemisphere)			
+X26579.2.0	Mean intensity of Accumbens-area (right hemisphere)			
+X26595.2.0	Volume of Accumbens-area (right hemisphere)
+
+Temp fix for this
+```{r}
+
+IDP_name_table <- IDP_name_table %>%
+  mutate(dimension = ifelse(IDP %in% c("X26564.2.0", "X26595.2.0"), "volume", dimension))
+
+```
+
+
+Calculate total WM from right and left white matter volume from ASEG
+total_wm = X26553.2.0 + X26584.2.0
+```{r}
+
+ukbio_IDP <- ukbio_IDP %>%
+  mutate(total_wm = X26553.2.0 + X26584.2.0)
+
+```
+
+Select the p25 rfMRI derived IDPs
+
+```{r}
+
+#rfMRI_p25 <- ukbio_IDP %>%
+#  select(c(n_eid, contains("P25")))
+
+```
+
+Select IDPs from the keep list for further processing, then join on rfMRI
+```{r}
+
+ukbio_IDP <- ukbio_IDP %>%
+  select(c(n_eid, all_of(IDP_name_table$IDP)))
+
+```
+
+What IDPs are now left in ukbio IDP?
+```{r}
+
+IDP_tally <- data.frame("IDP" = colnames(ukbio_IDP)[! colnames(ukbio_IDP) == "n_eid"]) %>%
+  left_join(IDP_name_table, by = "IDP") %>%
+  mutate(group = ifelse(IDP %in% c("X26514.2.0", "X26518.2.0", "total_wm", "X26527.2.0", "X26528.2.0"), "global", "regional")) %>%
+  group_by(MRI, map, dimension, dMRI, group) %>%
+  tally() %>%
+  mutate(MRI = factor(MRI, levels = c("T1", "T2", "rfMRI", "dMRI"))) %>%
+  arrange(MRI) %>%
+  arrange(group)
+
+IDP_tally %>%
+  kable()
+
+
+```
+
+7/8/2024 NA / NA / NA / NA is 210 p25 rfMRI IDPs
+
+Save the IDP tally
+```{r}
+
+save(IDP_tally, file = paste0(output_path, "IDP_tally_p1_", Sys.Date(), ".RData"))
+
+```
+
+Get a list of the IDP names
+```{r}
+
+IDP_all_names <- colnames(ukbio_IDP)[! colnames(ukbio_IDP) == "n_eid"]
+
+```
+
+
+Create a table to display the number missing and how that compares as a percentage of the total data
+```{r}
+
+image_missing <- ukbio_IDP %>%
+  summarise_at(vars(all_of(IDP_all_names)), ~ sum(is.na(.x))) %>%
+  pivot_longer(cols = everything(), names_to = "IDP", values_to = "n_missing") %>%
+  mutate(percent_missing = n_missing / nrow(ukbio_IDP) * 100) %>%
+  left_join(IDP_name_table, by = "IDP")
+  
+```
+
+Plot the percent missing by MRI type
+
+```{r}
+
+image_missing %>%
+  mutate(MRI = ifelse(MRI == "T1", ifelse(map == "global" | map == "FIRST", "T1 global / FIRST",
+                                          ifelse(map == "FAST", "T1 FAST", "T1 regional")), MRI)) %>%
+  mutate(MRI = fct_reorder(MRI, -percent_missing)) %>%
+  ggplot(aes(x = reorder(IDP, -percent_missing), y = percent_missing, color = MRI)) +
+  geom_point() +
+  ggtitle(paste0("Missing values per IDP as Percent of N (N=", nrow(ukbio_IDP), ")")) +
+  xlab(paste0("IDP (IDPs =", nrow(image_missing), ")")) +
+  ylab("Percent of observations") +
+  ylim(c(0, 8))
+
+```
+
+Group by MRI type and display % missing
+
+```{r}
+
+image_missing %>%
+  mutate(MRI = ifelse(IDP == "X25781.2.0", "total_hyperintensities", MRI)) %>%
+  group_by(MRI, map) %>%
+  summarise(percent_missing = mean(percent_missing)) %>%
+  arrange(desc(percent_missing)) %>%
+  mutate(percent_missing = formatC(percent_missing, digits = 3, format = "f")) %>%
+  kable(caption = paste0("Missing values per MRI Category as Percent of N (N=", nrow(ukbio_IDP), ")")) %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+  
+
+```
+
+Drop participants missing ANY IDP (this is because all IDPs will go to the brain age model)
+```{r}
+
+ukbio_IDP <- na.omit(ukbio_IDP)
+
+```
+
+
+
+
+Add rows to the N tracker
+
+```{r}
+
+n_tracker <- rbind(n_tracker, data.frame("Step" = c("MRI missing dropped"),
+           "N" = c(nrow(ukbio_IDP))))
+
+n_tracker
+
+```
+
+
+```{r}
+
+save(ukbio_IDP, file = paste0(output_path, "ukbio_IDP_", Sys.Date(), ".RData"))
+
+```
+
+Save the list of eid
+```{r}
+
+all_eid <- ukbio_IDP$n_eid
+save(all_eid, file = paste0(output_path, "all_eid_p1_", Sys.Date(), ".RData"))
+
+```
+
+
+Save and view the n tracker
+```{r}
+
+save(n_tracker, file = paste0(output_path, "n_tracker_p1_", Sys.Date(), ".RData"))
+
+n_tracker
+
+
+```
+
+
+```{r}
+
+print(paste0("Script last run ", Sys.Date()))
+
+```
+
+

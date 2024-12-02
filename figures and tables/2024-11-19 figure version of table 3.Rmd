@@ -1,0 +1,246 @@
+---
+title: "Category regressions with GMV only"
+---
+
+Run alcohol only and alcohol + brainPAD but with the category regression instead of continuous
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(broom)
+library(kableExtra)
+
+```
+
+```{r}
+
+model_version <- "main"
+
+```
+
+Set the filepaths for input and output
+ENSURE THIS IS A LOCATION SUITABLE FOR STORAGE OF UKB DATA
+```{r}
+
+input_path <- # data set storage location
+
+output_path <- # script outputs storage location
+
+```
+
+
+Put the date IDPs processed
+```{r}
+
+run_date <- "2024-11-13" 
+
+```
+
+
+```{r}
+
+load(paste0(output_path, "IDP_names_table_", run_date, ".RData"))
+
+```
+
+
+Load genetic PCs
+```{r}
+
+load(paste0(output_path, "genetic_PC_", run_date, ".RData"))
+
+```
+
+Load the processed imaging covariates
+From step 2 of the pipeline
+```{r}
+
+load(paste0(output_path, "/processed_imaging_covariates_", "2024-07-29", ".RData"))
+
+```
+
+Load the covariates that have been processed with backfilling imaging data with baseline data and then imputation
+From step 3 of the pipeline
+```{r}
+
+load(paste0(output_path, "/imputed_covariates_", run_date, ".RData"))
+
+```
+
+```{r}
+
+load(paste0(output_path, model_version, "_brainPAD_", run_date, ".RData"))
+
+```
+
+
+Combine the tables to make a regression table
+Create a column for scaled brainPAD
+```{r}
+
+regression_table <- imputation_results %>%
+  select(-c(sex, age, date)) %>%
+  filter(n_eid %in% experimental_brainPAD$n_eid) %>%
+  left_join(genetic_PC, by = "n_eid") %>%
+  left_join(imaging_covariates, by = "n_eid") %>%
+  left_join(select(experimental_brainPAD, -age), by = "n_eid") %>%
+  mutate(scaled_brainPAD = scale(brainPAD, center = TRUE, scale = TRUE))
+  
+rm(imputation_results)
+rm(imaging_covariates)
+rm(genetic_PC)
+gc()
+
+```
+
+Create the alcohol category column
+Use the week drinks variable in the covariates to create bins
+If changing this make sure to also change in demographics or the numbers will not line up!
+```{r}
+
+regression_table <- regression_table %>%
+  mutate(drink_group = case_when(
+    alcohol_status == "Never" ~ 6,
+    alcohol_status == "Former" ~ 6,
+    week_drinks <= 1 ~ 0, # Current alcohol consumption with less than 1 drink per week are the reference group
+    week_drinks <= 7 ~ 1,
+    week_drinks <= 14 ~ 2,
+    week_drinks <= 21 ~ 3,
+    week_drinks <= 28 ~ 4,
+    week_drinks > 28 ~ 5))
+
+
+```
+
+
+Note that the < 1 group includes some participants who indicated they do drink (current) in data field 1558 but who end up with calculated week drinks of 0
+
+Factor drink groups, and specify that 0 (lightest drinking group) is the reference level
+```{r}
+
+regression_table$drink_group <- factor(regression_table$drink_group)
+#regression_table$drink_group <- relevel(regression_table$drink_group, ref = 0)
+
+class(regression_table$drink_group)
+levels(regression_table$drink_group)
+
+```
+
+Check the N in each drinking category
+```{r}
+
+group_n <- regression_table %>%
+  group_by(drink_group) %>%
+  tally()
+
+group_n
+
+```
+
+
+
+Scale brainPAD
+```{r}
+
+regression_table <- regression_table %>%
+  mutate(scaled_brainPAD = scale(brainPAD, center = TRUE, scale = TRUE))
+
+```
+
+
+Set up the list of covariates (updated 7/25/24)
+```{r}
+
+covariates <-c("sex", "age", "scaled_pack_years", "income", "education_years",
+               "BMI", "diabetes", "systolic_BP", "diastolic_BP", "health_rating", "longstanding",
+               "head_size", "site", "date", "rfMRI_motion",
+               "PC_1", "PC_2", "PC_3", "PC_4", "PC_5", "PC_6", "PC_7", "PC_8", "PC_9", "PC_10")
+
+
+predictor <- "drink_group"
+
+```
+
+
+```{r}
+
+regression <- glm(formula(paste("regression_table$brainPAD ~",
+                                             paste(c(predictor, covariates), collapse = "+"))),
+                                              family = "gaussian", data = regression_table)
+
+```
+
+Clean up the regression results
+```{r}
+
+result_table <- tidy(regression)
+result_table
+
+```
+
+Make the results into a nice table showing the relationship
+
+```{r}
+
+brain_PAD_regression <- result_table %>%
+  filter(grepl("drink_group", term)) %>%
+  # Add a row to account for the reference group (infrequent, < 1)
+  rbind(data.frame("term" = c("0"), "estimate" = c(0), std.error = c(NA), statistic = c(NA), "p.value" = c(NA))) %>%
+  mutate(drink_group = gsub("drink_group", "", term)) %>%
+  # Factor and order
+  mutate(drink_group = factor(drink_group, levels = c(6, 0, 1, 2, 3, 4, 5))) %>%
+  arrange(drink_group) %>%
+  # Add readable group names
+  mutate(week_drinks = case_when(
+    drink_group == 6 ~ "0 (never)",
+    drink_group == 0 ~ "<=1*",
+    drink_group == 1 ~ ">1-7",
+    drink_group == 2 ~ ">7-14",
+    drink_group == 3 ~ ">14-21",
+    drink_group == 4 ~ ">21-28",
+    drink_group == 5 ~ ">28")) %>%
+  left_join(group_n, by = "drink_group") %>%
+  # Calculate confidence intervals
+  mutate(interval = 1.86 * std.error) %>%
+  mutate(lower = estimate - interval) %>%
+  mutate(upper = estimate + interval) %>%
+  select(-c(term, statistic, std.error, drink_group, interval)) %>%
+  relocate(estimate, .after = n) %>%
+  relocate(p.value, .after = upper)
+
+brain_PAD_regression
+
+```
+
+```{r}
+
+theme_replace(
+  # Set the axis text size
+  axis.text.x = element_text(size = 13), axis.text.y = element_text(size = 13),
+  # Background white with no grid lines
+  panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "white", color = "dark grey"))
+
+```
+
+
+Make it into a figure
+```{r}
+
+brain_PAD_regression %>%
+  mutate(week_drinks = factor(week_drinks, levels = c("0 (never)", "<=1*", ">1-7", ">7-14",
+                                                      ">14-21", ">21-28", ">28"))) %>%
+  ggplot(aes(x = week_drinks, y = estimate)) +
+  geom_point(size = 1.8, color = "blue") +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, size = 0.8) +
+  ylab("BrainPAD (years)") +
+  xlab("Drinking category (drinks per week)") +
+  geom_hline(yintercept = 0, color = "darkgrey", size = 0.8, alpha = 0.5) +
+  ylim(c(-1, 3))
+
+```
+
+
+

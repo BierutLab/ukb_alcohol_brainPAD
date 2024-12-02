@@ -1,0 +1,816 @@
+---
+title: "Brain PAD model demographics"
+---
+
+Important difference from other demograpic tables is that all, train_test, and experimental are broken out
+Also we show the health metrics used to define a healthy subset to select train_test from
+
+
+```{r}
+library(dplyr) # Run install.packages("tidyverse") to get this
+library(tidyr) # Run install.packages("tidyr") to get this
+library(ggplot2)
+library("reshape") # Run install.packages("reshape") to get this
+library("broom")
+library(kableExtra) # Run install.packages("kableExtra")
+library(mice)
+
+```
+
+Set the date when prior pipeline steps were run
+```{r}
+
+run_date <- "2024-11-13"
+
+```
+
+Set the filepaths for input and output
+ENSURE THIS IS A LOCATION SUITABLE FOR STORAGE OF UKB DATA
+```{r}
+
+input_path <- # data set storage location
+
+output_path <- # script outputs storage location
+
+```
+
+
+```{r}
+
+load(paste0(output_path, "all_eid_p7_", run_date, ".RData"))
+load(paste0(output_path, "experimental_eid_", run_date, ".RData"))
+load(paste0(output_path, "train_eid_", run_date, ".RData"))
+load(paste0(output_path, "test_eid_", run_date, ".RData"))
+
+```
+
+Load the unscaled covariates generated after imputation
+```{r}
+
+load(paste0(output_path, "un_scaled_covariates_", run_date, ".RData"))
+
+un_scaled <- un_scaled %>%
+  filter(n_eid %in% all_eid)
+
+```
+
+
+For brain model paper demographics, we also want to include race
+No filtering on race / ethnicity
+```{r}
+
+ethnicity <- read.csv(paste0(input_path, "race_ethnicity_6_13_23.csv"))
+
+```
+
+Race / ethnicity
+Data field 21000 ethnic background
+Uses data coding 1001
+1001 = White British
+1002 = Irish
+1003 = Any other white background
+
+The take-away is that most of this sample is white so coding as white and non-white
+Report percentage known to be white vs. non white and unknown
+More participants have values from the baseline survey
+```{r}
+
+ethnicity <- ethnicity %>%
+  filter(n_eid %in% all_eid) %>%
+  dplyr::rename("ethnicity" = n_21000_0_0) %>%
+  mutate(ethnicity = case_when(
+    ethnicity == 1001 ~ 1,
+    ethnicity == 1002 ~ 1,
+    ethnicity == 1003 ~ 1,
+    TRUE ~ 0))
+
+```
+
+Add on to un-scaled
+```{r}
+
+un_scaled <- un_scaled %>%
+  left_join(select(ethnicity, c(n_eid, ethnicity)), by = "n_eid")
+
+```
+
+
+```{r}
+
+un_scaled <- un_scaled %>%
+  mutate(set = ifelse(n_eid %in% train_eid, "train",
+                      ifelse(n_eid %in% test_eid, "test",
+                             ifelse(n_eid %in% experimental_eid, "experimental", NA))))
+
+un_scaled %>%
+  group_by(set) %>%
+  tally()
+
+```
+
+
+Make tables for train / test and experimental
+```{r}
+
+train <- un_scaled %>%
+  filter(n_eid %in% train_eid)
+
+test <- un_scaled %>%
+  filter(n_eid %in% test_eid)
+
+experimental <- un_scaled %>%
+  filter(n_eid %in% experimental_eid)
+
+```
+
+
+Construct the demographics table
+Table structured:
+covariate name -- groups -- percent
+```{r}
+
+demo_table <- data.frame("covariate" = c("N", "N", "N", "N"),
+                         "groups" = c(" ", " ", " ", " "),
+                         "set" = c("all", "train", "test", "experimental"),
+                         "n" = c(nrow(un_scaled),
+                                 nrow(train),
+                                 nrow(test),
+                                 nrow(experimental)))
+
+demo_table
+
+```
+
+Add sex
+
+```{r}
+
+sex <- data.frame("covariate" = rep("Sex", 8),
+                  "groups" = c("Female", "Male", "Female", "Male", "Female", "Male", "Female", "Male"),
+                  "set" = c("all", "all", "train", "train", "test", "test", "experimental", "experimental"),
+                  "n" = c(sum(un_scaled$sex == 0), sum(un_scaled$sex == 1),
+                          sum(train$sex == 0), sum(train$sex == 1),
+                          sum(test$sex == 0), sum(test$sex == 1),
+                          sum(experimental$sex == 0), sum(experimental$sex == 1)))
+sex
+
+```
+
+Race / ethnicity
+```{r}
+
+ethnicity <- data.frame("covariate" = rep("Race / ethnicity", 4),
+                  "groups" = rep("white", 4),
+                  "set" = c("all", "train", "test", "experimental"),
+                  "n" = c(sum(un_scaled$ethnicity == 1),
+                          sum(train$ethnicity == 1),
+                          sum(test$ethnicity == 1),
+                          sum(experimental$ethnicity == 1)))
+
+ethnicity
+
+```
+
+
+Age
+```{r}
+
+
+age <- un_scaled %>%
+  mutate(groups = case_when(
+    age < 60 ~ "<60",
+    age >= 70 ~ "70+",
+    TRUE ~ "60-69")) %>%
+  select(groups) %>%
+  group_by(groups) %>%
+  tally() %>%
+  mutate(covariate = "Age") %>%
+  mutate(set = "all") %>%
+  relocate(covariate, .before = groups) %>%
+  relocate(set, .after = groups)
+
+
+age_sets <- un_scaled %>%
+  mutate(groups = case_when(
+    age < 60 ~ "<60",
+    age >= 70 ~ "70+",
+    TRUE ~ "60-69")) %>%
+  select(groups, set) %>%
+  group_by(set, groups) %>%
+  tally() %>%
+  mutate(covariate = "Age") %>%
+  relocate(covariate, .before = groups)
+
+age <- rbind(age, age_sets)
+
+age
+
+```
+
+
+Alcohol
+0 = never
+1 = previous
+2 = current
+
+
+```{r}
+
+
+alcohol_status <- un_scaled %>%
+  select(alcohol_status) %>%
+  group_by(alcohol_status) %>%
+  tally() %>%
+  mutate(covariate = "Alcohol use") %>%
+  relocate(covariate, .before = alcohol_status) %>%
+  dplyr::rename("groups" = alcohol_status) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n) %>%
+  mutate(groups = factor(groups, levels = c("Never", "Former", "Current"))) %>%
+  arrange(groups)
+
+alcohol_status_sets <- un_scaled %>%
+  select(alcohol_status, set) %>%
+  group_by(alcohol_status, set) %>%
+  tally() %>%
+  mutate(covariate = "Alcohol use") %>%
+  relocate(covariate, .before = alcohol_status) %>%
+  dplyr::rename("groups" = alcohol_status) %>%
+  relocate(set, .before = n) %>%
+  mutate(groups = factor(groups, levels = c("Never", "Former", "Current"))) %>%
+  arrange(groups)
+
+alcohol_status <- rbind(alcohol_status, alcohol_status_sets)
+
+alcohol_status
+
+```
+
+
+Drinks per week
+```{r}
+
+dpw <- un_scaled %>%
+  mutate(groups = case_when(
+    alcohol_status == "Never" ~ "0 (never)",
+    alcohol_status == "Former" ~ "0 (former)",
+    week_drinks <= 1 ~ "<=1",
+    week_drinks <= 7 ~ ">1-7",
+    week_drinks <= 14 ~ ">7-14",
+    week_drinks <= 21 ~ ">14-21",
+    week_drinks <= 28 ~ ">21-28",
+    week_drinks > 28 ~ ">28")) %>%
+  select(groups) %>%
+  group_by(groups) %>%
+  tally() %>%
+  mutate(groups = factor(groups, levels = c("0 (never)", "0 (former)", "<=1", ">1-7",
+                                            ">7-14", ">14-21", ">21-28", ">28"))) %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+  mutate(covariate = "Drinks per week") %>%
+  relocate(covariate, .before = groups) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n)
+
+
+dpw_sets <- un_scaled %>%
+  mutate(groups = case_when(
+    alcohol_status == "Never" ~ "0 (never)",
+    alcohol_status == "Former" ~ "0 (former)",
+    week_drinks <= 1 ~ "<=1",
+    week_drinks <= 7 ~ ">1-7",
+    week_drinks <= 14 ~ ">7-14",
+    week_drinks <= 21 ~ ">14-21",
+    week_drinks <= 28 ~ ">21-28",
+    week_drinks > 28 ~ ">28")) %>%
+  select(groups, set) %>%
+  group_by(groups, set) %>%
+  tally() %>%
+  mutate(groups = factor(groups, levels = c("0 (never)", "0 (former)", "<=1", ">1-7",
+                                            ">7-14", ">14-21", ">21-28", ">28"))) %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+  mutate(covariate = "Drinks per week") %>%
+  relocate(covariate, .before = groups)
+
+dpw <- rbind(dpw, dpw_sets)
+
+dpw
+
+```
+
+
+
+```{r}
+
+
+smoking_status <- un_scaled %>%
+  select(smoking_status) %>%
+  group_by(smoking_status) %>%
+  tally() %>%
+  mutate(covariate = "Smoking") %>%
+  relocate(covariate, .before = smoking_status) %>%
+  dplyr::rename("groups" = smoking_status) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n) %>%
+  mutate(groups = factor(groups, levels = c("Never", "Former", "Current"))) %>%
+  arrange(groups)
+
+smoking_status_sets <- un_scaled %>%
+  select(smoking_status, set) %>%
+  group_by(smoking_status, set) %>%
+  tally() %>%
+  mutate(covariate = "Smoking") %>%
+  relocate(covariate, .before = smoking_status) %>%
+  dplyr::rename("groups" = smoking_status) %>%
+  relocate(set, .before = n) %>%
+  mutate(groups = factor(groups, levels = c("Never", "Former", "Current"))) %>%
+  arrange(groups)
+
+smoking_status <- rbind(smoking_status, smoking_status_sets)
+
+smoking_status
+
+```
+
+```{r}
+
+pack_years <- un_scaled %>%
+  mutate(groups = case_when(
+    never_smoked == 1 ~ "0 (never)",
+    pack_years <= 1 ~ "<=1 (infrequent)",
+    week_drinks <= 10 ~ ">1-10",
+    week_drinks <= 20 ~ ">10-20",
+    week_drinks <= 40 ~ ">20-40",
+    week_drinks > 40 ~ ">40")) %>%
+  select(groups) %>%
+  group_by(groups) %>%
+  tally() %>%
+  mutate(groups = factor(groups, levels = c("0 (never)", "<=1 (infrequent)", ">1-10",
+                                            ">10-20", ">20-40", ">40"))) %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+  mutate(covariate = "Pack years") %>%
+  relocate(covariate, .before = groups) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n)
+
+
+pack_years_sets <- un_scaled %>%
+  mutate(groups = case_when(
+    never_smoked == 1 ~ "0 (never)",
+    pack_years <= 1 ~ "<=1 (infrequent)",
+    week_drinks <= 10 ~ ">1-10",
+    week_drinks <= 20 ~ ">10-20",
+    week_drinks <= 40 ~ ">20-40",
+    week_drinks > 40 ~ ">40")) %>%
+  select(groups, set) %>%
+  group_by(groups, set) %>%
+  tally() %>%
+  mutate(groups = factor(groups, levels = c("0 (never)", "<=1 (infrequent)", ">1-10",
+                                            ">10-20", ">20-40", ">40"))) %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+  mutate(covariate = "Pack years") %>%
+  relocate(covariate, .before = groups)
+
+pack_years <- rbind(pack_years, pack_years_sets)
+
+pack_years
+
+
+```
+
+
+
+```{r}
+
+income <- un_scaled %>%
+  mutate(groups = case_when(
+    income < 17999 ~ "<18,000",
+    income < 31000 ~ "18,000-30,999",
+    income < 52000 ~ "31,000-51,999",
+    income < 100000 ~ "52,000-99,999",
+    income >= 100000 ~ ">100,000")) %>%
+  group_by(groups) %>%
+  tally() %>%
+  mutate(groups = factor(groups, levels = c("<18,000", "18,000-30,999", "31,000-51,999",
+                                            "52,000-99,999", ">100,000"))) %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+  mutate(covariate = "Income") %>%
+  relocate(covariate, .before = groups) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n)
+
+income_sets <- un_scaled %>%
+  mutate(groups = case_when(
+    income < 17999 ~ "<18,000",
+    income < 31000 ~ "18,000-30,999",
+    income < 52000 ~ "31,000-51,999",
+    income < 100000 ~ "52,000-99,999",
+    income >= 100000 ~ ">100,000")) %>%
+  select(groups, set) %>%
+  group_by(groups, set) %>%
+  tally() %>%
+  mutate(groups = factor(groups, levels = c("<18,000", "18,000-30,999", "31,000-51,999",
+                                            "52,000-99,999", ">100,000"))) %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+  mutate(covariate = "Income") %>%
+  relocate(covariate, .before = groups)
+
+income <- rbind(income, income_sets)
+
+income
+
+```
+
+We want education as high, mid, or low, classified by qualification
+High ((1)College or University degree [ISCED 5 (20)])
+Mid ((2)A levels/AS levels or equivalent [ISCED 3], (5)NVQ or HND or HNC or equivalent [ISCED (19)], (6) Other prof. qual. eg: nursing, teaching [ISCED 4])
+Low ((3)O levels/GCSEs or equivalent [ISCED 2], (4)CSEs or equivalent [ISCED 2], (7)None of the above [ISCED 1])
+
+6/27/23 UKB added Data coding 100305
+1	College or University degree
+2	A levels/AS levels or equivalent
+3	O levels/GCSEs or equivalent
+4	CSEs or equivalent
+5	NVQ or HND or HNC or equivalent
+6	Other professional qualifications eg: nursing, teaching
+-7	None of the above
+-3	Prefer not to answer
+
+
+non_imaging_covariates <- non_imaging_covariates %>%
+  mutate(education_years = case_when(
+    n_6138_2_0 == -7 ~ 7,
+    n_6138_2_0 == 4 ~ 10,
+    n_6138_2_0 == 3 ~ 10,
+    n_6138_2_0 == 2 ~ 13,
+    n_6138_2_0 == 6 ~ 15,
+    n_6138_2_0 == 5 ~ 19,
+    n_6138_2_0 == 1 ~ 20))
+
+
+For now I think this is sufficient and makes sense, although it is to be noted I know very little about UK education levels.
+1/20/22 Updated to use the imaging visit value
+
+```{r}
+
+un_scaled <- un_scaled %>%
+  mutate(education_level = case_when(
+    education_years < 9.8 ~ "< 10 years",
+    education_years < 16  ~ "10-16 years (CSEs or O levels and above)",
+    education_years >= 16  ~ ">16 years (college or university degree)"))
+
+```
+
+
+
+```{r}
+
+education <- un_scaled %>%
+  group_by(education_level) %>%
+  tally() %>%
+  dplyr::rename("groups" = education_level) %>%
+  mutate(groups = factor(groups, levels = c("< 10 years", "10-16 years (CSEs or O levels and above)",
+                        ">16 years (college or university degree)"))) %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+   mutate(covariate = "Education") %>%
+  relocate(covariate, .before = groups) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n)
+
+
+education_sets <- un_scaled %>%
+  group_by(education_level, set) %>%
+  tally() %>%
+  dplyr::rename("groups" = education_level) %>%
+  mutate(groups = factor(groups, levels = c("< 10 years", "10-16 years (CSEs or O levels and above)",
+                        ">16 years (college or university degree)"))) %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+   mutate(covariate = "Education") %>%
+  relocate(covariate, .before = groups)
+
+education <- rbind(education, education_sets)
+
+education
+
+```
+
+
+Health rating
+```{r}
+
+health_rating <- un_scaled %>%
+  mutate(health_rating = round(as.numeric(health_rating))) %>%
+  mutate(groups = case_when(
+    health_rating == 1 ~ "1 (excellent)",
+    health_rating == 2 ~ "2 (good)",
+    health_rating == 3 ~ "3 (fair)",
+    health_rating == 4 ~ "4 (poor)")) %>%
+  group_by(groups) %>%
+  tally() %>%
+  mutate(groups = factor(groups, levels = c("1 (excellent)", "2 (good)", "3 (fair)", "4 (poor)"))) %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+  mutate(covariate = "Health rating") %>%
+  relocate(covariate, .before = groups) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n)
+
+health_rating_sets <- un_scaled %>%
+  mutate(health_rating = round(as.numeric(health_rating))) %>%
+  mutate(groups = case_when(
+    health_rating == 1 ~ "1 (excellent)",
+    health_rating == 2 ~ "2 (good)",
+    health_rating == 3 ~ "3 (fair)",
+    health_rating == 4 ~ "4 (poor)")) %>%
+  select(groups, set) %>%
+  group_by(groups, set) %>%
+  tally() %>%
+  mutate(groups = factor(groups, levels = c("1 (excellent)", "2 (good)", "3 (fair)", "4 (poor)"))) %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+  mutate(covariate = "Health rating") %>%
+  relocate(covariate, .before = groups)
+
+health_rating <- rbind(health_rating, health_rating_sets)
+
+health_rating
+
+```
+
+
+Longstanding illness
+```{r}
+
+longstanding <- un_scaled %>%
+  select(longstanding) %>%
+  pivot_longer(cols = everything(), names_to = "covariate", values_to = "value") %>%
+  group_by(covariate, value) %>%
+  tally() %>%
+  filter(value > 0) %>%
+  mutate(groups = "present") %>%
+  relocate(groups, .before = n) %>%
+  select(-value) %>%
+  relocate(covariate, .before = groups) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n)
+
+longstanding_sets <- un_scaled %>%
+  select(longstanding, set) %>%
+  pivot_longer(cols = -set, names_to = "covariate", values_to = "value") %>%
+  group_by(set, covariate, value) %>%
+  tally() %>%
+  # Make it so train_test has values even if they are zero
+  mutate(n = ifelse(set == "train_test", 0, n)) %>%
+  mutate(value = ifelse(set == "train_test", 1, value)) %>%
+  filter(value > 0) %>%
+  mutate(groups = "present") %>%
+  relocate(groups, .before = n) %>%
+  select(-value) %>%
+  relocate(covariate, .before = groups)
+
+longstanding <- rbind(longstanding, longstanding_sets)
+
+longstanding
+
+```
+
+Diabetes
+```{r}
+
+diabetes <- un_scaled %>%
+  select(diabetes) %>%
+  pivot_longer(cols = everything(), names_to = "covariate", values_to = "value") %>%
+  group_by(covariate, value) %>%
+  tally() %>%
+  filter(value > 0) %>%
+  mutate(groups = "present") %>%
+  relocate(groups, .before = n) %>%
+  select(-value) %>%
+  relocate(covariate, .before = groups) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n)
+
+diabetes_sets <- un_scaled %>%
+  select(diabetes, set) %>%
+  pivot_longer(cols = -set, names_to = "covariate", values_to = "value") %>%
+  group_by(set, covariate, value) %>%
+  tally() %>%
+  # Make it so train_test has values even if they are zero
+  mutate(n = ifelse(set == "train_test", 0, n)) %>%
+  mutate(value = ifelse(set == "train_test", 1, value)) %>%
+  filter(value > 0) %>%
+  mutate(groups = "present") %>%
+  relocate(groups, .before = n) %>%
+  select(-value) %>%
+  relocate(covariate, .before = groups)
+
+diabetes <- rbind(diabetes, diabetes_sets)
+
+diabetes
+
+```
+
+
+
+BMI
+Classification of under / normal / over weight fom here: https://www.ncbi.nlm.nih.gov/books/NBK279167/
+Underweight	< 18.5
+Normal†	18.5–24.9
+Overweight	25.0–29.9
+Obesity	30.0-39.9
+Extreme Obesity	≥ 40
+```{r}
+
+BMI <- un_scaled %>%
+  mutate(groups = case_when(
+    BMI <= 18.5 ~ "<=18.5 (underweight)",
+    BMI <= 24.9 ~ ">18.5 - 24.9 (normal)",
+    BMI <= 29.9 ~ ">24.9 - 29.9 (overweight)",
+    BMI <= 39.9 ~ ">29.9 - 39.9 (obesity)",
+    TRUE ~ ">=40 (extreme obesity)")) %>%
+  select(groups) %>%
+  group_by(groups) %>%
+  tally() %>%
+  mutate(covariate = "BMI") %>%
+  relocate(covariate, .before = groups) %>%
+  mutate(groups = factor(groups, levels = c("<=18.5 (underweight)", ">18.5 - 24.9 (normal)",
+                         ">24.9 - 29.9 (overweight)", ">29.9 - 39.9 (obesity)", ">=40 (extreme obesity)"))) %>%
+  arrange(groups) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n)
+
+
+BMI_sets <- un_scaled %>%
+  mutate(groups = case_when(
+    BMI <= 18.5 ~ "<=18.5 (underweight)",
+    BMI <= 24.9 ~ ">18.5 - 24.9 (normal)",
+    BMI <= 29.9 ~ ">24.9 - 29.9 (overweight)",
+    BMI <= 39.9 ~ ">29.9 - 39.9 (obesity)",
+    TRUE ~ ">=40 (extreme obesity)")) %>%
+  select(groups, set) %>%
+  group_by(groups, set) %>%
+  tally() %>%
+  mutate(groups = factor(groups, levels = c("<=18.5 (underweight)", ">18.5 - 24.9 (normal)",
+                         ">24.9 - 29.9 (overweight)", ">29.9 - 39.9 (obesity)", ">=40 (extreme obesity)"))) %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+  mutate(covariate = "BMI") %>%
+  relocate(covariate, .before = groups)
+
+BMI <- rbind(BMI, BMI_sets)
+
+BMI
+
+```
+
+
+SBP:  
+Normal < 120  
+Elevated <= 129  
+High (stage 1) <= 139  
+High (stage 2) > 140 
+```{r}
+
+SBP <- un_scaled %>%
+  mutate(groups = case_when(
+    systolic_BP <= 120 ~ "<=120 (normal)",
+    systolic_BP <= 129 ~ ">120 - 129 (elevated)",
+    systolic_BP <= 139 ~ ">129 - 139 (high, stage 1)",
+    systolic_BP > 139 ~ ">139 (high, stage 2)",
+    TRUE ~ "other")) %>% # number of high BP seems a lot, older population?
+  select(groups) %>%
+  group_by(groups) %>%
+  tally() %>%
+  mutate(covariate = "Systolic blood pressure") %>%
+  relocate(covariate, .before = groups) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n)
+
+SBP_sets <- un_scaled %>%
+  mutate(groups = case_when(
+    systolic_BP <= 120 ~ "<=120 (normal)",
+    systolic_BP <= 129 ~ ">120 - 129 (elevated)",
+    systolic_BP <= 139 ~ ">129 - 139 (high, stage 1)",
+    systolic_BP > 139 ~ ">139 (high, stage 2)",
+    TRUE ~ "other")) %>% # number of high BP seems a lot, older population?
+  select(groups, set) %>%
+  group_by(groups, set) %>%
+  tally() %>%
+  filter(! is.na(groups)) %>%
+  mutate(covariate = "Systolic blood pressure") %>%
+  relocate(covariate, .before = groups)
+
+SBP <- rbind(SBP, SBP_sets)
+
+
+SBP
+
+```
+
+
+DBP:  
+Normal / elevated < 80  
+High (stage 1) <= 90  
+High (stage 2) > 90
+
+
+```{r}
+
+DBP <- un_scaled %>%
+  mutate(groups = case_when(
+    diastolic_BP <= 80 ~ "<=80 (normal / elevated)",
+    diastolic_BP <= 90 ~ ">80 - 90 (high, stage 1)",
+    TRUE ~ ">90 (high, stage 2)")) %>%
+  select(groups) %>%
+  group_by(groups) %>%
+  tally() %>%
+  mutate(covariate = "Diastolic blood pressure") %>%
+  relocate(covariate, .before = groups) %>%
+  mutate(set = "all") %>%
+  relocate(set, .before = n)
+
+DBP_sets <- un_scaled %>%
+  mutate(groups = case_when(
+    diastolic_BP <= 80 ~ "<=80 (normal / elevated)",
+    diastolic_BP <= 90 ~ ">80 - 90 (high, stage 1)",
+    TRUE ~ ">90 (high, stage 2)")) %>%
+  select(groups, set) %>%
+  group_by(groups, set) %>%
+  tally() %>%
+  arrange(groups) %>%
+  filter(! is.na(groups)) %>%
+  mutate(covariate = "Diastolic blood pressure") %>%
+  relocate(covariate, .before = groups)
+
+DBP <- rbind(DBP, DBP_sets)
+
+
+DBP
+
+```
+
+Stick the tables together to view
+```{r}
+
+demo_table <- demo_table %>%
+  rbind(sex) %>%
+  rbind(age) %>%
+  rbind(ethnicity) %>%
+  rbind(income) %>%
+  rbind(education) %>%
+  rbind(alcohol_status) %>%
+  rbind(dpw) %>%
+  rbind(smoking_status) %>%
+  rbind(pack_years) %>%
+  rbind(BMI) %>%
+  rbind(diabetes) %>%
+  rbind(SBP) %>%
+  rbind(DBP) %>%
+  rbind(health_rating) %>%
+  rbind(longstanding) %>%
+  pivot_wider(id_cols = c(covariate, groups), names_from = set, values_from = n) %>%
+  mutate(all_percent = all / nrow(un_scaled) * 100) %>%
+  relocate(all_percent, .after = all) %>%
+  dplyr::rename("train_n" = train) %>%
+  dplyr::rename("test_n" = test) %>%
+  mutate(train_percent = train_n / nrow(train) * 100) %>%
+  mutate(test_percent = test_n / nrow(test) * 100) %>%
+  relocate(train_percent, .after = train_n) %>%
+  relocate(test_percent, .after = test_n) %>%
+  dplyr::rename("exp_n" = experimental) %>%
+  mutate(exp_percent = exp_n / nrow(experimental) * 100) %>%
+  relocate(exp_percent, .after = exp_n) %>%
+  mutate_at(vars(all_percent, train_percent, test_percent, exp_percent), ~round(.x))
+
+
+```
+
+
+```{r}
+
+demo_table
+
+```
+
+Save in an excel sheet and R data
+```{r}
+
+#save(demographics, file = paste0("imaging_demographics_", Sys.Date(), ".RData"))
+write.csv(demo_table, file = paste0("demographics_", Sys.Date(), ".csv"))
+
+```
+
+
+
+
+
+
+
+
